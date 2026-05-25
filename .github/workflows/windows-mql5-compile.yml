@@ -1,4 +1,4 @@
-name: Windows MQL5 Compile
+name: Windows Public Validation
 
 on:
   workflow_dispatch:
@@ -16,44 +16,61 @@ permissions:
   contents: read
 
 jobs:
-  compile-public-validation:
-    runs-on:
-      - self-hosted
-      - windows
-      - mql5
+  validate-public-compile-automation:
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate runner configuration
+      - name: Verify curated public validation targets
         shell: pwsh
         run: |
-          if (-not $env:MQL5_ROOT) {
-            throw 'MQL5_ROOT is not set. Point it at the target MetaTrader MQL5 directory on the self-hosted runner.'
-          }
-          if (-not (Test-Path -LiteralPath $env:MQL5_ROOT)) {
-            throw "MQL5_ROOT does not exist: $env:MQL5_ROOT"
-          }
-          if (-not $env:METAEDITOR_PATH) {
-            throw 'METAEDITOR_PATH is not set. Point it at MetaEditor64.exe on the self-hosted runner.'
-          }
-          if (-not (Test-Path -LiteralPath $env:METAEDITOR_PATH)) {
-            throw "METAEDITOR_PATH does not exist: $env:METAEDITOR_PATH"
+          $requiredPaths = @(
+            'Tools/compile-public-validation.ps1'
+            'Scripts/MQTT/Tools/compile-mql5.ps1'
+            'Scripts/MQTT/Tools/Resolve-MT5Paths.ps1'
+            'Scripts/MQTT/Tests/Unit/Protocol/TEST_MQTT.mq5'
+            'Scripts/MQTT/Tests/Unit/Session/TEST_MqttClient.mq5'
+            'Scripts/MQTT/Tests/Unit/Transport/TEST_Transport.mq5'
+            'Scripts/MQTT/Tests/Unit/Queue/TEST_PublishQueue.mq5'
+            'Experts/MQTT/Harnesses/PublishQueueTestHarness.mq5'
+          )
+
+          foreach ($relativePath in $requiredPaths) {
+            if (-not (Test-Path -LiteralPath $relativePath)) {
+              throw "Required validation file not found: $relativePath"
+            }
           }
 
-      - name: Sync tree and compile curated public validation set
+      - name: Parse PowerShell validation helpers
         shell: pwsh
         run: |
-          .\Tools\compile-public-validation.ps1 `
-            -TargetMql5Root $env:MQL5_ROOT `
-            -MetaEditorPath $env:METAEDITOR_PATH `
-            -SyncRepoToTarget
+          $scripts = @(
+            'Tools/compile-public-validation.ps1'
+            'Scripts/MQTT/Tools/compile-mql5.ps1'
+            'Scripts/MQTT/Tools/Resolve-MT5Paths.ps1'
+          )
 
-      - name: Upload compile logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mql5-public-validation-logs
-          path: Tools/generated/public-validation
-          if-no-files-found: warn
+          foreach ($scriptPath in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $scriptPath),
+              [ref]$tokens,
+              [ref]$errors
+            )
+
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                Write-Error ("{0}:{1}: {2}" -f $scriptPath, $_.Extent.StartLineNumber, $_.Message)
+              }
+              throw "PowerShell parse failed: $scriptPath"
+            }
+          }
+
+      - name: Note full compile path
+        shell: pwsh
+        run: |
+          Write-Host 'GitHub-hosted Windows runners do not include MetaEditor or an MT5 data root.'
+          Write-Host 'Run .\Tools\compile-public-validation.ps1 locally on an MT5-enabled Windows machine for full compile validation.'

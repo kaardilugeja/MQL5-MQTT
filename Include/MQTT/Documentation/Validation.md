@@ -42,7 +42,7 @@ Example:
 
 If MetaEditor is not installed in the default Windows location, pass `-MetaEditorPath` explicitly or set `METAEDITOR_PATH` before running the helper.
 
-For repository automation, `.github/workflows/windows-mql5-compile.yml` is provided for a self-hosted Windows runner. Set runner environment variables `MQL5_ROOT` and `METAEDITOR_PATH`, then the workflow will sync `Include/MQTT`, `Scripts/MQTT`, and `Experts/MQTT` into that MT5 root before compiling.
+For repository automation, `.github/workflows/windows-mql5-compile.yml` runs on GitHub-hosted Windows and validates that the curated compile helper, supporting scripts, and tracked validation targets are present and syntactically sound. Full MetaEditor compilation remains a local Windows step through `Tools/compile-public-validation.ps1`, because GitHub-hosted runners do not ship with MetaEditor or an MT5 `MQL5` data root.
 
 ## Optional Live Broker Test Setup
 
