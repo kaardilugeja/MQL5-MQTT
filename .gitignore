@@ -1,0 +1,62 @@
+# Build outputs and disposable runtime artifacts
+*.ex4
+*.ex5
+*.log
+*.result.txt
+*.tmp
+
+# Local MT5 runtime state
+experts.dat
+Files/
+Images/
+Indicators/
+Libraries/
+Logs/
+Presets/
+Profiles/
+Services/
+"Shared Projects"/
+Levels/
+Params/
+
+# Editor-local and generated helper output
+.copilot-temp/
+.cursor/
+.qoder/
+.vscode/
+.vscode/generated/
+.public-staging/
+/compile_commands.json
+
+# Local-only overrides used for private validation
+**/*.local.*
+**/*.override.*
+
+# Keep the tracked tree focused on the MQTT library roots
+Experts/*
+!Experts/MQTT/
+!Experts/MQTT/**
+
+Scripts/*
+!Scripts/MQTT/
+!Scripts/MQTT/**
+
+Include/*
+!Include/MQTT/
+!Include/MQTT/**
+
+# Re-ignore generated artifacts inside the tracked MQTT roots
+Experts/MQTT/.vscode/
+Experts/MQTT/**/*.ex4
+Experts/MQTT/**/*.ex5
+Experts/MQTT/**/*.log
+Experts/MQTT/**/*.result.txt
+
+Scripts/MQTT/.vscode/
+Scripts/MQTT/**/*.ex4
+Scripts/MQTT/**/*.ex5
+Scripts/MQTT/**/*.log
+Scripts/MQTT/**/*.result.txt
+Scripts/MQTT/Tools/generated/
+
+Include/MQTT/.vscode/

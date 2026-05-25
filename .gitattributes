@@ -1,0 +1,39 @@
+# Keep archive exports aligned with the curated public release surface.
+
+# Generated outputs and disposable artifacts never belong in release archives.
+*.ex4 export-ignore
+*.ex5 export-ignore
+*.log export-ignore
+*.result.txt export-ignore
+
+# Local staging, editor output, and private working notes.
+.copilot-temp/** export-ignore
+.public-staging/** export-ignore
+.vscode/** export-ignore
+
+# Private experts and local automation.
+Experts/MQTT/.vscode/** export-ignore
+Experts/MQTT/Generated/** export-ignore
+Experts/MQTT/Operations/** export-ignore
+Experts/MQTT/Production/** export-ignore
+
+# Non-public validation scaffolding.
+Scripts/MQTT/Smoke/** export-ignore
+Scripts/MQTT/Tools/generated/** export-ignore
+Scripts/MQTT/Tools/harden-remote-emqx.ps1 export-ignore
+Scripts/MQTT/Tools/publish-remote-qos2.ps1 export-ignore
+Scripts/MQTT/Tools/run-mt5-compliance-scenario.ps1 export-ignore
+Scripts/MQTT/Tools/run-mt5-crash-window-measurement.ps1 export-ignore
+Scripts/MQTT/Tools/write-launcher-command.ps1 export-ignore
+Scripts/MQTT/Tests/.vscode/** export-ignore
+Scripts/MQTT/Tests/Compliance/** export-ignore
+Scripts/MQTT/Tests/Integration/** export-ignore
+Scripts/MQTT/Tests/Regression/** export-ignore
+Scripts/MQTT/Tests/TEST_Integration.mq5 export-ignore
+Scripts/MQTT/Tests/TEST_ProtocolCompliance.mq5 export-ignore
+Scripts/MQTT/Tests/TEST_Regression.mq5 export-ignore
+Scripts/MQTT/Tests/TEST_SessionDatabase.mq5 export-ignore
+Scripts/MQTT/Tests/TEST_Stress.mq5 export-ignore
+Scripts/MQTT/Tests/TEST_WebSocketTransport.mq5 export-ignore
+Scripts/MQTT/Tests/Unit/Session/TEST_SessionDatabase.mq5 export-ignore
+Scripts/MQTT/Tests/Unit/Transport/TEST_WebSocketTransport.mq5 export-ignore

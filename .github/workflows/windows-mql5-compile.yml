@@ -1,0 +1,59 @@
+name: Windows MQL5 Compile
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/windows-mql5-compile.yml'
+      - 'Experts/MQTT/**'
+      - 'Include/MQTT/**'
+      - 'Scripts/MQTT/**'
+      - 'Tools/compile-public-validation.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  compile-public-validation:
+    runs-on:
+      - self-hosted
+      - windows
+      - mql5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate runner configuration
+        shell: pwsh
+        run: |
+          if (-not $env:MQL5_ROOT) {
+            throw 'MQL5_ROOT is not set. Point it at the target MetaTrader MQL5 directory on the self-hosted runner.'
+          }
+          if (-not (Test-Path -LiteralPath $env:MQL5_ROOT)) {
+            throw "MQL5_ROOT does not exist: $env:MQL5_ROOT"
+          }
+          if (-not $env:METAEDITOR_PATH) {
+            throw 'METAEDITOR_PATH is not set. Point it at MetaEditor64.exe on the self-hosted runner.'
+          }
+          if (-not (Test-Path -LiteralPath $env:METAEDITOR_PATH)) {
+            throw "METAEDITOR_PATH does not exist: $env:METAEDITOR_PATH"
+          }
+
+      - name: Sync tree and compile curated public validation set
+        shell: pwsh
+        run: |
+          .\Tools\compile-public-validation.ps1 `
+            -TargetMql5Root $env:MQL5_ROOT `
+            -MetaEditorPath $env:METAEDITOR_PATH `
+            -SyncRepoToTarget
+
+      - name: Upload compile logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mql5-public-validation-logs
+          path: Tools/generated/public-validation
+          if-no-files-found: warn
