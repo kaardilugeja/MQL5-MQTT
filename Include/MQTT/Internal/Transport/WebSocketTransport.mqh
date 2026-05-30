@@ -64,6 +64,7 @@ class CWebSocketTransport : public IMqttTransport {
   uint   m_ws_head;          // Read cursor (start of unprocessed data)
   uint   m_ws_tail;          // Write cursor (end of accumulated data)
   uint   m_max_ws_buf_size;  // Max WebSocket buffer size in bytes (0 = unlimited)
+  bool   m_allow_masked_server_frames;  // Compatibility escape hatch for non-compliant server frames
 
   //--- Pre-allocated send frame buffer (7.2.3: avoids per-send allocation)
   uchar  m_send_frame[];  // Reusable buffer for outgoing WebSocket frames
@@ -139,6 +140,7 @@ class CWebSocketTransport : public IMqttTransport {
     m_max_ws_buf_size = max_size;
     m_framer.SetMaxBufferSize(max_size);
   }
+  void          SetAllowMaskedServerFrames(bool allow = true) { m_allow_masked_server_frames = allow; }
   virtual void  SetKeepAlive(uint seconds) override { m_keepalive.SetKeepAlive(seconds); }
   virtual void  SetPingRespTimeout(uint sec) override { m_keepalive.SetPingRespTimeout(sec); }
   virtual void  SetReadTimeout(uint ms) override { m_read_timeout = ms; }
@@ -253,6 +255,7 @@ CWebSocketTransport::CWebSocketTransport() {
   m_ws_head                      = 0;
   m_ws_tail                      = 0;
   m_max_ws_buf_size              = 0;   // Unlimited by default
+  m_allow_masked_server_frames   = false;
   m_pending_path                 = "/mqtt";
   ArrayResize(m_ws_buf, 4096, 4096);
   ArrayResize(m_recv_buf, 4096, 4096);  // Pre-allocate to avoid per-Poll heap allocation
@@ -1150,7 +1153,8 @@ ENUM_TRANSPORT_ERROR CWebSocketTransport::Send(const uchar &pkt[], int len) {
 //| Purpose: Parse and extract payload from next complete WS frame   |
 //| Parameters: out_payload - output buffer for extracted payload    |
 //| Return: true if payload extracted, false if need more data       |
-//| Note: Handles unmasking of server-to-client frames per RFC 6455  |
+//| Note: Strict mode rejects masked server frames; compatibility    |
+//|       mode can still unmask them for non-compliant peers.        |
 //+------------------------------------------------------------------+
 bool CWebSocketTransport::_NextWsFramePayload(uchar &out_payload[]) {
   //--- Calculate bytes available in the internal buffer
@@ -1175,6 +1179,12 @@ bool CWebSocketTransport::_NextWsFramePayload(uchar &out_payload[]) {
     return false;
   }
   bool masked      = (b1 & 0x80) != 0;  // Server-to-client frames should NOT be masked per spec
+  if (masked && !m_allow_masked_server_frames) {
+    MQTT_LOG_ERROR("WS server frame used the MASK bit — protocol violation per RFC 6455 §5.1. "
+                   "Disconnecting. Use SetAllowMaskedServerFrames(true) only for non-compliant compatibility.");
+    Disconnect();
+    return false;
+  }
   uint payload_len = b1 & 0x7F;
   uint header_len  = 2;
 
@@ -1230,8 +1240,7 @@ bool CWebSocketTransport::_NextWsFramePayload(uchar &out_payload[]) {
     ArrayResize(out_payload, payload_len);
     ArrayCopy(out_payload, m_ws_buf, 0, m_ws_head + header_len + mask_len, payload_len);
 
-    //--- Unmask payload per RFC 6455 Section 5.3
-    //--- Although server-to-client frames should NOT be masked, we handle it for robustness.
+    //--- Unmask payload only in explicit compatibility mode for non-compliant peers.
     if (masked) {
       uchar m0 = m_ws_buf[m_ws_head + header_len];      // Mask key byte 0
       uchar m1 = m_ws_buf[m_ws_head + header_len + 1];  // Mask key byte 1

@@ -17,7 +17,8 @@
 //+------------------------------------------------------------------+
 #define MQTT_UNIT_TESTS
 #include "..\..\TestUtil.mqh"
-#include <MQTT/Internal/Transport/Transport.mqh>
+#include "..\..\..\..\..\Include\MQTT\Internal\Transport\Transport.mqh"
+#include "..\..\..\..\..\Include\MQTT\Internal\Transport\WebSocketTransport.mqh"
 
 //+------------------------------------------------------------------+
 //| Helper: build a minimal MQTT 5.0 QoS-0 PUBLISH packet            |
@@ -57,6 +58,34 @@ void BuildLargerPublish(uchar &pkt[]) {
   //--- 20 byte payload: 0x00-0x13
   for (int i = 0; i < 20; i++) {
     pkt[9 + i] = (uchar)i;
+  }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: build a small WebSocket frame for parser unit tests      |
+//| Uses a deterministic mask key so compatibility-mode assertions   |
+//| can verify the unmasked bytes exactly.                           |
+//+------------------------------------------------------------------+
+void BuildWsFrame(const uchar opcode, const uchar &payload[], const bool masked, uchar &frame[]) {
+  uint  payload_len = (uint)ArraySize(payload);
+  uchar mask_key[]  = {0x11, 0x22, 0x33, 0x44};
+  uint  frame_len   = 2 + (masked ? 4 : 0) + payload_len;
+
+  ArrayResize(frame, (int)frame_len);
+  frame[0] = (uchar)(0x80 | (opcode & 0x0F));
+  frame[1] = (uchar)((masked ? 0x80 : 0x00) | payload_len);
+
+  uint payload_offset = 2;
+  if (masked) {
+    frame[2]      = mask_key[0];
+    frame[3]      = mask_key[1];
+    frame[4]      = mask_key[2];
+    frame[5]      = mask_key[3];
+    payload_offset = 6;
+  }
+
+  for (uint i = 0; i < payload_len; i++) {
+    frame[payload_offset + i] = masked ? (payload[i] ^ mask_key[i % 4]) : payload[i];
   }
 }
 
@@ -729,6 +758,120 @@ bool TEST_Transport_FirstPendingTlsKeepsWaitingWithSameBudget() {
 }
 
 //+------------------------------------------------------------------+
+//| TEST_WebSocket_MaskedServerFrameRejectedByDefault                |
+//| Strict mode must fail closed on a masked server-to-client frame. |
+//+------------------------------------------------------------------+
+bool TEST_WebSocket_MaskedServerFrameRejectedByDefault() {
+  TEST_CASE_START();
+
+  CWebSocketTransport ws;
+  uchar               payload[] = {0x30, 0x00};
+  uchar               frame[];
+  uchar               out[];
+
+  BuildWsFrame(0x2, payload, true, frame);
+  ws.TestSetConnected(true);
+  ws.TestInjectWsBytes(frame, (uint)ArraySize(frame));
+
+  ASSERT_FALSE(ws.TestNextWsFramePayload(out));
+  ASSERT_EQ(0, ArraySize(out));
+  ASSERT_FALSE(ws.TestIsConnected());
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_WebSocket_MaskedServerFrameAllowedInCompatibilityMode       |
+//| Compatibility mode must still unmask and deliver the payload.    |
+//+------------------------------------------------------------------+
+bool TEST_WebSocket_MaskedServerFrameAllowedInCompatibilityMode() {
+  TEST_CASE_START();
+
+  CWebSocketTransport ws;
+  uchar               payload[] = {0x30, 0x02, 0x00};
+  uchar               frame[];
+  uchar               out[];
+
+  BuildWsFrame(0x2, payload, true, frame);
+  ws.SetAllowMaskedServerFrames(true);
+  ws.TestInjectWsBytes(frame, (uint)ArraySize(frame));
+
+  ASSERT_TRUE(ws.TestNextWsFramePayload(out));
+  ASSERT_EQ(ArraySize(payload), ArraySize(out));
+  ASSERT_EQ((int)payload[0], (int)out[0]);
+  ASSERT_EQ((int)payload[1], (int)out[1]);
+  ASSERT_EQ((int)payload[2], (int)out[2]);
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_WebSocket_PingFrameDoesNotSurfaceAsMqttPayload             |
+//| Ping frames must be consumed internally and not reach MQTT.      |
+//+------------------------------------------------------------------+
+bool TEST_WebSocket_PingFrameDoesNotSurfaceAsMqttPayload() {
+  TEST_CASE_START();
+
+  CWebSocketTransport ws;
+  uchar               payload[] = {0xAA, 0xBB};
+  uchar               frame[];
+  uchar               out[];
+
+  BuildWsFrame(0x9, payload, false, frame);
+  ws.TestInjectWsBytes(frame, (uint)ArraySize(frame));
+
+  ASSERT_FALSE(ws.TestNextWsFramePayload(out));
+  ASSERT_EQ(0, ArraySize(out));
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_WebSocket_PongFrameDoesNotSurfaceAsMqttPayload             |
+//| Pong frames must be ignored by the MQTT framer path.             |
+//+------------------------------------------------------------------+
+bool TEST_WebSocket_PongFrameDoesNotSurfaceAsMqttPayload() {
+  TEST_CASE_START();
+
+  CWebSocketTransport ws;
+  uchar               payload[] = {0x01};
+  uchar               frame[];
+  uchar               out[];
+
+  BuildWsFrame(0xA, payload, false, frame);
+  ws.TestInjectWsBytes(frame, (uint)ArraySize(frame));
+
+  ASSERT_FALSE(ws.TestNextWsFramePayload(out));
+  ASSERT_EQ(0, ArraySize(out));
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_WebSocket_CloseFrameDisconnectsAndStaysOutOfMqtt           |
+//| Close frames must not be surfaced as MQTT payload and must       |
+//| transition the transport to disconnected.                        |
+//+------------------------------------------------------------------+
+bool TEST_WebSocket_CloseFrameDisconnectsAndStaysOutOfMqtt() {
+  TEST_CASE_START();
+
+  CWebSocketTransport ws;
+  uchar               payload[] = {0x03, 0xE8};
+  uchar               frame[];
+  uchar               out[];
+
+  BuildWsFrame(0x8, payload, false, frame);
+  ws.TestSetConnected(true);
+  ws.TestInjectWsBytes(frame, (uint)ArraySize(frame));
+
+  ASSERT_FALSE(ws.TestNextWsFramePayload(out));
+  ASSERT_EQ(0, ArraySize(out));
+  ASSERT_FALSE(ws.TestIsConnected());
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
 //| OnStart — test runner                                            |
 //+------------------------------------------------------------------+
 void OnStart() {
@@ -740,7 +883,7 @@ void OnStart() {
   int    total_assertions = 0;
 
   string names[];
-  ArrayResize(names, 22);
+  ArrayResize(names, 27);
   names[0]  = "TEST_Framer_CompletePacket";
   names[1]  = "TEST_Framer_ByteByByteFeed";
   names[2]  = "TEST_Framer_TwoPacketsCoalesced";
@@ -763,6 +906,11 @@ void OnStart() {
   names[19] = "TEST_Transport_RestartedPendingTlsKeepsRetryingWithBudget";
   names[20] = "TEST_Transport_ThirdPendingTlsFallsBackAfterTwoRestarts";
   names[21] = "TEST_Transport_FirstPendingTlsKeepsWaitingWithSameBudget";
+  names[22] = "TEST_WebSocket_MaskedServerFrameRejectedByDefault";
+  names[23] = "TEST_WebSocket_MaskedServerFrameAllowedInCompatibilityMode";
+  names[24] = "TEST_WebSocket_PingFrameDoesNotSurfaceAsMqttPayload";
+  names[25] = "TEST_WebSocket_PongFrameDoesNotSurfaceAsMqttPayload";
+  names[26] = "TEST_WebSocket_CloseFrameDisconnectsAndStaysOutOfMqtt";
 
   for (int i = 0; i < ArraySize(names); i++) {
     total++;
@@ -817,6 +965,16 @@ void OnStart() {
       result = TEST_Transport_ThirdPendingTlsFallsBackAfterTwoRestarts();
     } else if (names[i] == "TEST_Transport_FirstPendingTlsKeepsWaitingWithSameBudget") {
       result = TEST_Transport_FirstPendingTlsKeepsWaitingWithSameBudget();
+    } else if (names[i] == "TEST_WebSocket_MaskedServerFrameRejectedByDefault") {
+      result = TEST_WebSocket_MaskedServerFrameRejectedByDefault();
+    } else if (names[i] == "TEST_WebSocket_MaskedServerFrameAllowedInCompatibilityMode") {
+      result = TEST_WebSocket_MaskedServerFrameAllowedInCompatibilityMode();
+    } else if (names[i] == "TEST_WebSocket_PingFrameDoesNotSurfaceAsMqttPayload") {
+      result = TEST_WebSocket_PingFrameDoesNotSurfaceAsMqttPayload();
+    } else if (names[i] == "TEST_WebSocket_PongFrameDoesNotSurfaceAsMqttPayload") {
+      result = TEST_WebSocket_PongFrameDoesNotSurfaceAsMqttPayload();
+    } else if (names[i] == "TEST_WebSocket_CloseFrameDisconnectsAndStaysOutOfMqtt") {
+      result = TEST_WebSocket_CloseFrameDisconnectsAndStaysOutOfMqtt();
     }
 
     total_assertions += g_tests_passed + g_tests_failed;

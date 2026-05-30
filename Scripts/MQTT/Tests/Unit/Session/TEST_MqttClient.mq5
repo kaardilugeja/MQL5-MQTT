@@ -186,6 +186,71 @@ void ResetPersistentSessionStore(const string session_id) {
   db.Clear();
 }
 
+string GetPersistentSessionStorePath(const string session_id) {
+  return "MQTT_Sessions\\" + session_id + ".bin";
+}
+
+bool ReadPersistentSessionStoreBytes(const string session_id, uchar& data[]) {
+  ArrayResize(data, 0);
+
+  int file_handle = FileOpen(GetPersistentSessionStorePath(session_id), FILE_READ | FILE_BIN);
+  if (file_handle == INVALID_HANDLE) {
+    return false;
+  }
+
+  int file_size = (int)FileSize(file_handle);
+  if (file_size < 0) {
+    FileClose(file_handle);
+    return false;
+  }
+
+  if (ArrayResize(data, file_size) != file_size) {
+    FileClose(file_handle);
+    return false;
+  }
+
+  uint bytes_read = 0;
+  if (file_size > 0) {
+    bytes_read = (uint)FileReadArray(file_handle, data, 0, file_size);
+  }
+  FileClose(file_handle);
+
+  return file_size == 0 || bytes_read == (uint)file_size;
+}
+
+bool WritePersistentSessionStoreBytes(const string session_id, const uchar& data[]) {
+  string file_name = GetPersistentSessionStorePath(session_id);
+  if (FileIsExist(file_name) && !FileDelete(file_name)) {
+    return false;
+  }
+
+  int file_handle = FileOpen(file_name, FILE_WRITE | FILE_BIN);
+  if (file_handle == INVALID_HANDLE) {
+    return false;
+  }
+
+  uint bytes_written = 0;
+  if (ArraySize(data) > 0) {
+    bytes_written = (uint)FileWriteArray(file_handle, data, 0, ArraySize(data));
+  }
+  FileClose(file_handle);
+
+  return ArraySize(data) == 0 || bytes_written == (uint)ArraySize(data);
+}
+
+bool TamperPersistentSessionStoreByte(const string session_id, const int offset, const uchar delta) {
+  uchar file_bytes[];
+  if (!ReadPersistentSessionStoreBytes(session_id, file_bytes)) {
+    return false;
+  }
+  if (offset < 0 || offset >= ArraySize(file_bytes)) {
+    return false;
+  }
+
+  file_bytes[offset] = (uchar)(file_bytes[offset] ^ delta);
+  return WritePersistentSessionStoreBytes(session_id, file_bytes);
+}
+
 bool PacketContainsByte(const uchar &pkt[], const uchar needle) {
   int len = ArraySize(pkt);
   for (int i = 0; i < len; i++) {
@@ -552,7 +617,10 @@ bool TEST_DefaultState() {
   ASSERT_EQ(0, (int)mqtt.GetIncomingInFlightCount());
   ASSERT_EQ(0, (int)mqtt.GetOldestQueuedMessageAgeMs());
   ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPayloadBytes());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPropertyBytes());
   ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogBytes());
   ASSERT_EQ(0, mqtt.GetLastFailureCode());
   ASSERT_STR_EQ("", mqtt.GetLastFailureDescription());
   ASSERT_EQ((int)MQTT_FAILURE_NONE, (int)mqtt.GetLastFailureClass());
@@ -1982,6 +2050,112 @@ bool TEST_IncomingStorageErrorCountSurvivesClientRestart() {
 }
 
 //+------------------------------------------------------------------+
+//| TEST_EncryptedSessionRoundTrip                                  |
+//| Encrypted session files must save and restore with the same     |
+//| passphrase and mark the persisted file as encrypted.            |
+//+------------------------------------------------------------------+
+bool TEST_EncryptedSessionRoundTrip() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_encrypted_session_round_trip";
+  ResetPersistentSessionStore(session_id);
+
+  CSessionDatabase writer;
+  ASSERT_TRUE(writer.Init(session_id, true));
+  writer.SetEncryptionPassphrase("round-trip-secret");
+
+  uchar payload[] = {0x41, 0x42, 0x43, 0x44};
+  ASSERT_TRUE(writer.StoreOutgoingMessage(7, QoS_1, "secure/topic", payload, ArraySize(payload)));
+  ASSERT_TRUE(writer.SaveToFile());
+
+  uchar file_bytes[];
+  ASSERT_TRUE(ReadPersistentSessionStoreBytes(session_id, file_bytes));
+  ASSERT_TRUE(ArraySize(file_bytes) > 10);
+  ASSERT_EQ((int)MQTT_SESSION_FILE_FLAG_ENCRYPTED, (int)file_bytes[5]);
+
+  CSessionDatabase reader;
+  ASSERT_TRUE(reader.Init(session_id, true));
+  reader.SetEncryptionPassphrase("round-trip-secret");
+  ASSERT_TRUE(reader.LoadFromFile());
+
+  SessionMessage restored;
+  ASSERT_TRUE(reader.GetMessage(7, restored));
+  ASSERT_TRUE(restored.is_outgoing);
+  ASSERT_STR_EQ("secure/topic", restored.topic);
+  ASSERT_EQ(ArraySize(payload), (int)restored.payload_size);
+  ASSERT_EQ(ArraySize(payload), ArraySize(restored.payload));
+  for (int payload_index = 0; payload_index < ArraySize(payload); payload_index++) {
+    ASSERT_EQ((int)payload[payload_index], (int)restored.payload[payload_index]);
+  }
+
+  reader.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_EncryptedSessionWrongPassphraseFailsLoad                   |
+//| Loading with the wrong passphrase must fail without restoring   |
+//| persisted message state.                                        |
+//+------------------------------------------------------------------+
+bool TEST_EncryptedSessionWrongPassphraseFailsLoad() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_encrypted_session_wrong_passphrase";
+  ResetPersistentSessionStore(session_id);
+
+  CSessionDatabase writer;
+  ASSERT_TRUE(writer.Init(session_id, true));
+  writer.SetEncryptionPassphrase("correct-secret");
+
+  uchar payload[] = {0x55, 0x66, 0x77};
+  ASSERT_TRUE(writer.StoreOutgoingMessage(11, QoS_1, "secure/wrong-pass", payload, ArraySize(payload)));
+  ASSERT_TRUE(writer.SaveToFile());
+
+  CSessionDatabase reader;
+  ASSERT_TRUE(reader.Init(session_id, true));
+  reader.SetEncryptionPassphrase("wrong-secret");
+  ASSERT_FALSE(reader.LoadFromFile());
+
+  SessionMessage restored;
+  ASSERT_FALSE(reader.GetMessage(11, restored));
+
+  reader.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_EncryptedSessionTamperFailsLoad                            |
+//| Ciphertext tampering must prevent the persisted session from    |
+//| loading even with the correct passphrase.                       |
+//+------------------------------------------------------------------+
+bool TEST_EncryptedSessionTamperFailsLoad() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_encrypted_session_tamper";
+  ResetPersistentSessionStore(session_id);
+
+  CSessionDatabase writer;
+  ASSERT_TRUE(writer.Init(session_id, true));
+  writer.SetEncryptionPassphrase("tamper-secret");
+
+  uchar payload[] = {0x10, 0x20, 0x30};
+  ASSERT_TRUE(writer.StoreOutgoingMessage(23, QoS_1, "secure/tamper", payload, ArraySize(payload)));
+  ASSERT_TRUE(writer.SaveToFile());
+  ASSERT_TRUE(TamperPersistentSessionStoreByte(session_id, 10, 0x5A));
+
+  CSessionDatabase reader;
+  ASSERT_TRUE(reader.Init(session_id, true));
+  reader.SetEncryptionPassphrase("tamper-secret");
+  ASSERT_FALSE(reader.LoadFromFile());
+
+  SessionMessage restored;
+  ASSERT_FALSE(reader.GetMessage(23, restored));
+
+  reader.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
 //| TEST_FlatBufferAppendSizeRejectsOverflow                         |
 //| Guard calculations must reject 32-bit array append overflow.     |
 //+------------------------------------------------------------------+
@@ -2317,11 +2491,179 @@ bool TEST_CallbackBacklogTelemetrySurface() {
 
   ASSERT_EQ(1, g_cb_message_count);
   ASSERT_EQ(1, (int)mqtt.GetCallbackBacklogCount());
+  ASSERT_TRUE(mqtt.GetCallbackBacklogPayloadBytes() > 0);
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPropertyBytes());
 
   mqtt.TestDrainMessageCallbacks();
 
   ASSERT_EQ(2, g_cb_message_count);
   ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPayloadBytes());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPropertyBytes());
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_DeferredTransportBacklogTelemetrySurface                    |
+//| Deferred transport telemetry should reflect packets clipped by   |
+//| the per-poll dispatch budget until later Poll() calls drain them.|
+//+------------------------------------------------------------------+
+bool TEST_DeferredTransportBacklogTelemetrySurface() {
+  TEST_CASE_START();
+
+  CTestTransport tx;
+  CMqttClient    mqtt;
+  CPublish       p1;
+  CPublish       p2;
+  CPublish       p3;
+  uchar          payload1[] = {0x31};
+  uchar          payload2[] = {0x32};
+  uchar          payload3[] = {0x33};
+  uchar          pkt1[];
+  uchar          pkt2[];
+  uchar          pkt3[];
+
+  mqtt.TestInjectTransport(GetPointer(tx));
+  mqtt.TestSetState(MQTT_CLIENT_CONNECTED);
+  mqtt.SetMaxPacketsPerPoll(1);
+
+  p1.SetTopicName("telemetry/one");
+  p1.SetPayload(payload1);
+  p1.Build(pkt1);
+
+  p2.SetTopicName("telemetry/two");
+  p2.SetPayload(payload2);
+  p2.Build(pkt2);
+
+  p3.SetTopicName("telemetry/three");
+  p3.SetPayload(payload3);
+  p3.Build(pkt3);
+
+  tx.EnqueueIncoming(pkt1);
+  tx.EnqueueIncoming(pkt2);
+  tx.EnqueueIncoming(pkt3);
+
+  mqtt.Poll();
+  ASSERT_EQ(2, (int)mqtt.GetDeferredTransportBacklogCount());
+  ASSERT_EQ(ArraySize(pkt2) + ArraySize(pkt3), (int)mqtt.GetDeferredTransportBacklogBytes());
+
+  mqtt.Poll();
+  ASSERT_EQ(1, (int)mqtt.GetDeferredTransportBacklogCount());
+  ASSERT_EQ(ArraySize(pkt3), (int)mqtt.GetDeferredTransportBacklogBytes());
+
+  mqtt.Poll();
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogBytes());
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_DeferredTransportBacklogOverflowDisconnects                 |
+//| Transport backlog overflow must fail closed with reason 0x83 and |
+//| clear deferred transport telemetry.                              |
+//+------------------------------------------------------------------+
+bool TEST_DeferredTransportBacklogOverflowDisconnects() {
+  TEST_CASE_START();
+
+  CTestTransport tx;
+  CMqttClient    mqtt;
+  CPublish       p1;
+  CPublish       p2;
+  CPublish       p3;
+  uchar          payload1[] = {0x41};
+  uchar          payload2[] = {0x42};
+  uchar          payload3[] = {0x43};
+  uchar          pkt1[];
+  uchar          pkt2[];
+  uchar          pkt3[];
+
+  ResetCallbackState();
+  mqtt.SetOnError(TestOnError);
+  mqtt.SetOnDisconnect(TestOnDisconnect);
+  mqtt.TestInjectTransport(GetPointer(tx));
+  mqtt.TestSetState(MQTT_CLIENT_CONNECTED);
+  mqtt.SetMaxPacketsPerPoll(1);
+  mqtt.SetMaxDeferredTransportPackets(1);
+
+  p1.SetTopicName("overflow/one");
+  p1.SetPayload(payload1);
+  p1.Build(pkt1);
+
+  p2.SetTopicName("overflow/two");
+  p2.SetPayload(payload2);
+  p2.Build(pkt2);
+
+  p3.SetTopicName("overflow/three");
+  p3.SetPayload(payload3);
+  p3.Build(pkt3);
+
+  tx.EnqueueIncoming(pkt1);
+  tx.EnqueueIncoming(pkt2);
+  tx.EnqueueIncoming(pkt3);
+
+  mqtt.Poll();
+
+  ASSERT_EQ((int)MQTT_CLIENT_DISCONNECTED, (int)mqtt.GetState());
+  ASSERT_TRUE(g_cb_error_count > 0);
+  ASSERT_EQ((int)MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, g_cb_error_code);
+  ASSERT_TRUE(StringFind(g_cb_error_desc, "Deferred transport backlog packet limit reached") >= 0);
+  ASSERT_TRUE(g_cb_disconnect_count > 0);
+  ASSERT_EQ((int)MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, g_cb_disconnect_code);
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogBytes());
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+  ASSERT_EQ(0xE0, (int)tx.m_sent[0].data[0]);
+  ASSERT_EQ((int)MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, (int)tx.m_sent[0].data[2]);
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_DeferredCallbackBacklogOverflowDisconnects                  |
+//| Callback backlog overflow must fail closed with reason 0x83 and  |
+//| clear deferred callback telemetry.                               |
+//+------------------------------------------------------------------+
+bool TEST_DeferredCallbackBacklogOverflowDisconnects() {
+  TEST_CASE_START();
+
+  CTestTransport tx;
+  CMqttClient    mqtt;
+  CPublish       publish;
+  uchar          payload[] = {0x6F, 0x6B};
+  uchar          pkt[];
+
+  ResetCallbackState();
+  mqtt.SetHost("broker.test", 1883);
+  mqtt.SetOnError(TestOnError);
+  mqtt.SetOnDisconnect(TestOnDisconnect);
+  mqtt.SetMaxDeferredCallbackEvents(1);
+  mqtt.Subscribe("telemetry/#", TestOnMessage, QoS_1);
+  mqtt.Subscribe("telemetry/status", TestOnMessage, QoS_1);
+  mqtt.TestInjectTransport(GetPointer(tx));
+  mqtt.TestSetState(MQTT_CLIENT_CONNECTED);
+
+  publish.SetTopicName("telemetry/status");
+  publish.SetPayload(payload);
+  publish.Build(pkt);
+
+  tx.EnqueueIncoming(pkt);
+  mqtt.Poll();
+
+  ASSERT_EQ(0, g_cb_message_count);
+  ASSERT_EQ((int)MQTT_CLIENT_DISCONNECTED, (int)mqtt.GetState());
+  ASSERT_TRUE(g_cb_error_count > 0);
+  ASSERT_EQ((int)MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, g_cb_error_code);
+  ASSERT_TRUE(StringFind(g_cb_error_desc, "Deferred callback backlog count limit reached") >= 0);
+  ASSERT_TRUE(g_cb_disconnect_count > 0);
+  ASSERT_EQ((int)MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, g_cb_disconnect_code);
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPayloadBytes());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPropertyBytes());
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+  ASSERT_EQ(0xE0, (int)tx.m_sent[0].data[0]);
+  ASSERT_EQ((int)MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, (int)tx.m_sent[0].data[2]);
 
   return true;
 }
@@ -2915,6 +3257,10 @@ bool TEST_MetricsInitialization() {
   ASSERT_EQ(0, (int)mqtt.GetIncomingInFlightCount());
   ASSERT_EQ(0, (int)mqtt.GetOldestQueuedMessageAgeMs());
   ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPayloadBytes());
+  ASSERT_EQ(0, (int)mqtt.GetCallbackBacklogPropertyBytes());
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogCount());
+  ASSERT_EQ(0, (int)mqtt.GetDeferredTransportBacklogBytes());
   ASSERT_EQ(0, mqtt.GetLastFailureCode());
   ASSERT_STR_EQ("", mqtt.GetLastFailureDescription());
   ASSERT_EQ((int)MQTT_FAILURE_NONE, (int)mqtt.GetLastFailureClass());
@@ -4432,6 +4778,9 @@ void OnStart() {
   REGISTER_TEST(TEST_FlushSessionStateNowSucceedsWhenAlreadyDurable)
   REGISTER_TEST(TEST_OfflineQueuedPublishSurvivesClientRestart)
   REGISTER_TEST(TEST_IncomingStorageErrorCountSurvivesClientRestart)
+  REGISTER_TEST(TEST_EncryptedSessionRoundTrip)
+  REGISTER_TEST(TEST_EncryptedSessionWrongPassphraseFailsLoad)
+  REGISTER_TEST(TEST_EncryptedSessionTamperFailsLoad)
   REGISTER_TEST(TEST_FlatBufferAppendSizeRejectsOverflow)
   REGISTER_TEST(TEST_RetransmitPreservesPublishProperties)
   REGISTER_TEST(TEST_DiagnosticsCallbacksSurfaceMetadata)
@@ -4441,6 +4790,9 @@ void OnStart() {
   REGISTER_TEST(TEST_InFlightTelemetrySurface)
   REGISTER_TEST(TEST_QueuedAgeTelemetrySurface)
   REGISTER_TEST(TEST_CallbackBacklogTelemetrySurface)
+  REGISTER_TEST(TEST_DeferredTransportBacklogTelemetrySurface)
+  REGISTER_TEST(TEST_DeferredTransportBacklogOverflowDisconnects)
+  REGISTER_TEST(TEST_DeferredCallbackBacklogOverflowDisconnects)
   REGISTER_TEST(TEST_LastFailureTelemetrySurface)
   REGISTER_TEST(TEST_ConnackTimeoutBrokerFailureSurface)
   REGISTER_TEST(TEST_RedirectAllowlistBlocksUnapprovedHost)
@@ -4614,6 +4966,12 @@ void OnStart() {
       result = TEST_OfflineQueuedPublishSurvivesClientRestart();
     } else if (test_names[i] == "TEST_IncomingStorageErrorCountSurvivesClientRestart") {
       result = TEST_IncomingStorageErrorCountSurvivesClientRestart();
+    } else if (test_names[i] == "TEST_EncryptedSessionRoundTrip") {
+      result = TEST_EncryptedSessionRoundTrip();
+    } else if (test_names[i] == "TEST_EncryptedSessionWrongPassphraseFailsLoad") {
+      result = TEST_EncryptedSessionWrongPassphraseFailsLoad();
+    } else if (test_names[i] == "TEST_EncryptedSessionTamperFailsLoad") {
+      result = TEST_EncryptedSessionTamperFailsLoad();
     } else if (test_names[i] == "TEST_FlatBufferAppendSizeRejectsOverflow") {
       result = TEST_FlatBufferAppendSizeRejectsOverflow();
     } else if (test_names[i] == "TEST_RetransmitPreservesPublishProperties") {
@@ -4632,6 +4990,12 @@ void OnStart() {
       result = TEST_QueuedAgeTelemetrySurface();
     } else if (test_names[i] == "TEST_CallbackBacklogTelemetrySurface") {
       result = TEST_CallbackBacklogTelemetrySurface();
+    } else if (test_names[i] == "TEST_DeferredTransportBacklogTelemetrySurface") {
+      result = TEST_DeferredTransportBacklogTelemetrySurface();
+    } else if (test_names[i] == "TEST_DeferredTransportBacklogOverflowDisconnects") {
+      result = TEST_DeferredTransportBacklogOverflowDisconnects();
+    } else if (test_names[i] == "TEST_DeferredCallbackBacklogOverflowDisconnects") {
+      result = TEST_DeferredCallbackBacklogOverflowDisconnects();
     } else if (test_names[i] == "TEST_LastFailureTelemetrySurface") {
       result = TEST_LastFailureTelemetrySurface();
     } else if (test_names[i] == "TEST_ConnackTimeoutBrokerFailureSurface") {

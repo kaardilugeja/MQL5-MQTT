@@ -24,7 +24,7 @@ Expected result: each file compiles with `0 errors, 0 warnings`.
 
 `Unit/Queue/TEST_PublishQueue.mq5` and `PublishQueueTestHarness.mq5` share the same suite code through `PublishQueueTestSuite.mqh`, so they are the fastest way to verify the publish queue and coordinator runtime path together.
 
-The compile-first path is intentionally offline. `Scripts/MQTT/Tests/LiveBrokerConfig.mqh` ships with live broker testing disabled so a fresh public clone does not require network credentials or local broker setup just to compile.
+The compile-first path is intentionally offline. A fresh public clone does not require network credentials or local broker setup just to compile.
 
 For local Windows automation, run `Tools/compile-public-validation.ps1` from the repository root. By default it compiles the curated public validation set against the current working tree when the repository itself is your MT5 `MQL5` folder.
 
@@ -44,89 +44,13 @@ If MetaEditor is not installed in the default Windows location, pass `-MetaEdito
 
 For repository automation, `.github/workflows/windows-mql5-compile.yml` runs on GitHub-hosted Windows and validates that the curated compile helper, supporting scripts, and tracked validation targets are present and syntactically sound. Full MetaEditor compilation remains a local Windows step through `Tools/compile-public-validation.ps1`, because GitHub-hosted runners do not ship with MetaEditor or an MT5 `MQL5` data root.
 
-## Optional Live Broker Test Setup
+## Runtime Follow-Up Outside The Shipped Public Path
 
-If you want to run the tracked live CONNECT integration test after cloning into your MT5 `MQL5` folder, edit only this file:
+The tracked repository does not currently ship a checked-in broker runtime harness source file, a one-command broker launcher, or a public broker-connect test target. Any broker validation after the compile gate is therefore local and environment-specific rather than part of the shipped public green path.
 
-1. `Scripts/MQTT/Tests/LiveBrokerConfig.mqh`
+If you choose to do that follow-up locally, start from [MinimalClientExample.mq5](../../../Experts/MQTT/Harnesses/MinimalClientExample.mq5) and keep broker hosts, credentials, certificates, and MT5 launch details in local or ignored state. Add the broker host to `Tools -> Options -> Expert Advisors -> Allow WebRequest for listed URL` before testing.
 
-Set these values for your environment:
-
-1. `MQTT_TEST_LIVE_BROKER_ENABLED` -> `true`
-2. `MQTT_TEST_LIVE_BROKER_HOST` -> your broker hostname
-3. `MQTT_TEST_LIVE_BROKER_PORT` -> your broker port
-
-Then compile and run `Scripts/MQTT/Tests/Unit/Protocol/TEST_Connect.mq5`. When live testing is left disabled, that integration case is logged as skipped and the rest of the public compile-first path remains offline.
-
-This tracked live CONNECT case is a raw socket smoke check. It does not exercise the full `CMqttClient` timer or `Poll()` path. If it fails immediately with `SocketConnect()` or MT5 error `4014`, first verify the broker host is allowlisted in `Tools -> Options -> Expert Advisors -> Allow WebRequest for listed URL`, then rerun it. Treat that case as an optional environment-sensitive supplement, not as the supported public green path.
-
-## Optional Client-Level Live Smoke
-
-If you want a checked-in client-level runtime check that exercises `CMqttClient`, use:
-
-1. `Experts/MQTT/Harnesses/LiveBrokerSmoke.mq5`
-2. `Scripts/MQTT/Tools/run-mt5-live-broker-smoke.ps1`
-3. `Scripts/MQTT/Tools/invoke-remote-mosquitto-publish.ps1` when you want a broker-originated remote publish instead of loopback-only validation.
-
-The helper compiles the harness, writes a temporary MT5 start config, launches the terminal, waits for a single `SUMMARY status=...` line, and then stops the terminal again.
-
-Example native TLS run:
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 \
-	-ScenarioName live-smoke-tls8883 \
-	-BrokerHost broker.example.com \
-	-BrokerPort 8883 \
-	-UseTLS $true \
-	-RequireTLS $true \
-	-Username your-user \
-	-Password your-password
-```
-
-Example WSS run:
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 \
-	-ScenarioName live-smoke-wss443 \
-	-BrokerHost broker.example.com \
-	-BrokerPort 443 \
-	-UseTLS $true \
-	-UseWebSocket $true \
-	-WebSocketPath /mqtt \
-	-RequireTLS $true \
-	-Username your-user \
-	-Password your-password
-```
-
-When your MetaTrader terminal executable uses a different MT5 data root than the repository copy, pass that `MQL5` directory explicitly and sync the repo tree into it before launching:
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 \
-	-TargetMql5Root 'D:\MT5\MQL5' \
-	-SyncRepoToTarget
-```
-
-Expected pass signal: the summary line reports `status=PASS`, `connect_seen=true`, `suback_seen=true`, `publish_accepted=true`, `publish_ack_seen=true`, and `loopback_seen=true`.
-
-For a single-command remote QoS2 proof against a broker you can reach over SSH, enable the built-in remote inject path on the same runner. The helper waits for the remote subscription to appear in broker logs before publishing, so the QoS2 publish overlaps the live smoke run without a second manual terminal.
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 \
-	-ScenarioName live-smoke-tls8883-remote-qos2 \
-	-BrokerHost broker.example.com \
-	-BrokerPort 8883 \
-	-UseTLS $true \
-	-RequireTLS $true \
-	-Username your-user \
-	-Password your-password \
-	-ExpectRemoteMessage $true \
-	-RemoteInject $true \
-	-RemoteInjectSshDestination ssh-destination-placeholder \
-	-RemoteInjectSshKeyPath "$HOME\.ssh\id_ed25519" \
-	-RemoteInjectComposeDir /srv/mosquitto
-```
-
-When you want to publish from the broker side outside the MT5 runner, call `Scripts/MQTT/Tools/invoke-remote-mosquitto-publish.ps1` directly. It publishes via `mosquitto_pub` inside the configured Docker Compose project and can optionally wait until the target subscription appears in broker logs before sending the message.
+Use [Troubleshooting](Troubleshooting.md) for `SocketConnect()` and MT5 error `4014` failures before changing library code.
 
 ## Manual Runtime Checklist
 

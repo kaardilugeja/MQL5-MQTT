@@ -161,7 +161,7 @@ class CSessionDatabase {
   //--- survives a terminal restart that occurs during the outage.
   uint                 m_reconnect_failure_count;
   uint   m_incoming_storage_error_count;  // Consecutive incoming QoS2 persistence failures restored on load.
-  uchar  m_session_encryption_key[];      // Derived AES-256 key for encrypted session bodies; empty = plaintext.
+  uchar  m_session_encryption_key[];      // Single-pass SHA-256 passphrase hash used as the AES-256 key; empty = plaintext.
   bool   m_test_force_finalize_offline_fallback_once;  // Test hook that forces the finalize-fallback path once.
 
   //--- Private helper methods
@@ -195,6 +195,7 @@ class CSessionDatabase {
   bool   _IsOfflineQueuedMessageExpired(const OfflineQueuedMessage& msg, datetime now_time = 0, ulong now_us = 0) const;
   bool   _SerializeStateV7(uchar& body[]) const;
   bool   _DeserializeStateV7(const uchar& body[], int file_version);
+  bool   _ConstantTimeEqual(const uchar& lhs[], const uchar& rhs[], uint count) const;
   bool   _EncryptSerializedState(const uchar& plain_body[], uchar& stored_body[]) const;
   bool   _DecryptSerializedState(const uchar& stored_body[], uchar& plain_body[]) const;
   bool   _WriteThroughMutation();
@@ -341,8 +342,9 @@ CSessionDatabase::~CSessionDatabase() {}
 //+------------------------------------------------------------------+
 //| SetEncryptionPassphrase                                          |
 //| Purpose: Enable or disable AES-256 encryption for persisted      |
-//|          session files using a SHA-256 derived key and a         |
-//|          SHA-256 integrity envelope.                             |
+//|          session files using a single-pass SHA-256 passphrase    |
+//|          hash as the AES-256 key plus a SHA-256 integrity        |
+//|          envelope.                                               |
 //+------------------------------------------------------------------+
 void CSessionDatabase::SetEncryptionPassphrase(const string passphrase) {
   ArrayResize(m_session_encryption_key, 0);
@@ -369,6 +371,18 @@ void CSessionDatabase::SetEncryptionPassphrase(const string passphrase) {
 
   ArrayResize(m_session_encryption_key, ArraySize(derived_key));
   ArrayCopy(m_session_encryption_key, derived_key);
+}
+
+bool CSessionDatabase::_ConstantTimeEqual(const uchar& lhs[], const uchar& rhs[], uint count) const {
+  if ((uint)ArraySize(lhs) < count || (uint)ArraySize(rhs) < count) {
+    return false;
+  }
+
+  uint diff = 0;
+  for (uint i = 0; i < count; i++) {
+    diff |= (uint)(lhs[(int)i] ^ rhs[(int)i]);
+  }
+  return diff == 0;
 }
 
 //+------------------------------------------------------------------+
@@ -931,11 +945,9 @@ bool CSessionDatabase::_DecryptSerializedState(const uchar& stored_body[], uchar
     return false;
   }
 
-  for (int i = 0; i < 32; i++) {
-    if (actual_hash[i] != expected_hash[i]) {
-      MQTT_LOG_ERROR("Encrypted session file hash mismatch — wrong passphrase or tampered file");
-      return false;
-    }
+  if (!_ConstantTimeEqual(actual_hash, expected_hash, 32)) {
+    MQTT_LOG_ERROR("Encrypted session file hash mismatch — wrong passphrase or tampered file");
+    return false;
   }
 
   return true;

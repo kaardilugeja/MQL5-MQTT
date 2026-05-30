@@ -54,42 +54,18 @@ If your active terminal uses a different MT5 data root than the repository check
 
 Expected result: the helper reports `PASS` for the curated compile targets and each target compiles with `0 errors, 0 warnings`.
 
-## 4. Optional Live Broker Checks
+## 4. Optional Runtime Bring-Up After Compile
 
-The compile-first path is the supported offline green path. After that, you have two public live-broker options.
+The compile-first path is the supported public green path. The tracked repository does not currently ship a one-command live broker smoke helper or a checked-in live broker smoke harness source file.
 
-### Raw CONNECT Smoke
-
-If you want the smallest tracked live integration case, edit only [LiveBrokerConfig.mqh](../../../Scripts/MQTT/Tests/LiveBrokerConfig.mqh), enable the live test, set your broker host and port, then compile and run `Scripts/MQTT/Tests/Unit/Protocol/TEST_Connect.mq5`.
-
-Use this when you want a narrow socket-level proof that MT5 can reach the broker.
-
-### Full CMqttClient Smoke
-
-If you want an end-to-end client proof with subscriptions, publish flow, reconnect-safe polling, and summary output, use the checked-in smoke harness helper:
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 `
-  -ScenarioName live-smoke-tls8883 `
-  -BrokerHost broker.example.com `
-  -BrokerPort 8883 `
-  -UseTLS $true `
-  -RequireTLS $true `
-  -Username your-user `
-  -Password your-password
-```
-
-If you use WSS instead of native MQTT/TLS, switch to `-UseWebSocket $true` and provide `-WebSocketPath`.
+If you need broker-specific runtime verification after the compile gate passes, start from [MinimalClientExample.mq5](../../../Experts/MQTT/Harnesses/MinimalClientExample.mq5) and keep broker hosts, credentials, certificates, and launch details in local or ignored state instead of tracked files.
 
 Before any runtime test, add the broker host to `Tools -> Options -> Expert Advisors -> Allow WebRequest for listed URL`. MT5 still requires that allowlist entry before socket connections are permitted.
-
-Expected pass signal: the smoke harness prints and writes a `SUMMARY status=PASS` line.
 
 ## 5. Know Which Checked-In Example To Start With
 
 - [MinimalClientExample.mq5](../../../Experts/MQTT/Harnesses/MinimalClientExample.mq5): smallest timer-driven client example.
 - [PublishQueueTestHarness.mq5](../../../Experts/MQTT/Harnesses/PublishQueueTestHarness.mq5): queue durability and retransmit-oriented runtime harness.
-- [LiveBrokerSmoke.mq5](../../../Experts/MQTT/Harnesses/LiveBrokerSmoke.mq5): end-to-end broker validation harness.
 
 For a side-by-side comparison and extra snippets, use [Examples Guide](Examples.md).
 

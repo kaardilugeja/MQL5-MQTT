@@ -142,7 +142,12 @@ enum ENUM_MQTT_FAILURE_CLASS {
   MQTT_FAILURE_APPLICATION    = 7,  // Application-level error (EA logic or callback)
 };
 
-#define MQTT_DEFAULT_MAX_RECONNECT_ATTEMPTS 12
+#define MQTT_DEFAULT_MAX_RECONNECT_ATTEMPTS               12
+#define MQTT_DEFAULT_MAX_DEFERRED_TRANSPORT_PACKETS       500
+#define MQTT_DEFAULT_MAX_DEFERRED_TRANSPORT_BYTES         (1 * 1024 * 1024)
+#define MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_EVENTS         500
+#define MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_PAYLOAD_BYTES  (1 * 1024 * 1024)
+#define MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_PROPERTY_BYTES (1 * 1024 * 1024)
 
 //+------------------------------------------------------------------+
 //| Server Redirection callback                                      |
@@ -271,8 +276,8 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
 
   //--- Persistent subscription registry (replayed after every reconnect)
   //--- Parallel arrays replace struct array (MQL5 disallows arrays of structs with object members)
-  string                m_sub_topic[];                    // Subscription topic filters
-  uchar                 m_sub_qos[];                      // QoS level per subscription
+  string                m_sub_topic[];                      // Subscription topic filters
+  uchar                 m_sub_qos[];                        // QoS level per subscription
   MqttOnMessageCallback m_sub_cb[];        // Per-topic callback (NULL = global m_on_message)
   bool                  m_sub_no_local[];  // §3.8.3.1 No Local option per subscription
   bool                  m_sub_rap[];       // §3.8.3.1 Retain-As-Published option per subscription
@@ -318,6 +323,9 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   uint                   m_msg_evt_prop_len[];  // Property slice length inside m_msg_evt_prop_buf.
   uchar                  m_msg_evt_prop_buf[];  // Shared MQTT 5 property buffer backing deferred message events.
   uint                   m_msg_evt_count;       // Number of deferred message events queued for delivery.
+  uint                   m_max_deferred_callback_events;          // 0 = unlimited
+  uint                   m_max_deferred_callback_payload_bytes;   // 0 = unlimited
+  uint                   m_max_deferred_callback_property_bytes;  // 0 = unlimited
 
   //--- Pending subscription replay tracking
   //--- Parallel arrays + flat topics replace struct array
@@ -343,6 +351,9 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   //--- Always call m_pub_builder.Reset() before use.
   CPublish               m_pub_builder;
   PacketBuffer           m_deferred_transport_pkts[];  // Extracted packets deferred to the next Poll()
+  uint                   m_deferred_transport_bytes;   // Total bytes retained in the deferred transport backlog.
+  uint                   m_max_deferred_transport_packets;  // 0 = unlimited
+  uint                   m_max_deferred_transport_bytes;    // 0 = unlimited
   uint                   m_deferred_transport_count;   // Number of deferred packets buffered for the next Poll().
 
   //--- Pre-allocated match results (reused every Poll() cycle — avoids GC at 200 msg/s)
@@ -390,8 +401,9 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   MqttOnAuthExCallback         m_on_auth_ex;
   MqttOnRttThresholdCallback   m_on_rtt_threshold;
   MqttOnQoSDropCallback        m_on_qos_drop;
-  MqttOnPublishResultCallback  m_on_publish_result;       // Fires on every PUBACK/PUBCOMP (incl. errors)
+  MqttOnPublishResultCallback  m_on_publish_result;
   MqttOnAckCallback            m_on_ack;
+
   MqttOnPacketIdLowCallback    m_on_packetid_low;         // Fires when available packet IDs < threshold
   uint                         m_packetid_low_threshold;  // 0 = disabled
   ulong                        m_rtt_threshold_us;
@@ -418,9 +430,8 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   //--- Guards against infinite reconnect loops when the session DB can't persist
   //--- incoming QoS 2 messages (e.g. disk full). After N consecutive failures
   //--- the circuit trips, all reconnection stops, and m_on_error is fired.
-  uint                         m_incoming_storage_error_count;  // Consecutive StoreIncomingMessage failures
-  uint                         m_incoming_storage_error_max;    // Threshold before circuit breaks (default 5)
-
+  uint                         m_incoming_storage_error_count;
+  uint                         m_incoming_storage_error_max;
   //--- CONNECT User Properties (§3.1.2.11.7)
   //--- Key/value pairs appended to every CONNECT packet sent by this client.
   //--- Common use: commercial brokers that require auth metadata in CONNECT.
@@ -552,7 +563,9 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   void                 _SetState(ENUM_MQTT_CLIENT_STATE new_state);
   uint                 _ResolveConnectTimeoutMs(bool is_manual_connect) const;
   string               _DescribeConnectTimeout() const;
+  void                 _HandleBacklogOverflow(const string desc);
   void                 _AppendPacketCopy(PacketBuffer& dest[], uint& dest_count, const uchar& src[]);
+  bool                 _TryAppendDeferredTransportPacket(const uchar& pkt[]);
   void                 _AppendDeferredPackets(PacketBuffer& src[], uint start_idx, uint count);
   void                 _TakeDeferredPackets(PacketBuffer& out[], uint max_count, uint& out_count);
   ENUM_TRANSPORT_ERROR _HandleConnectSetupFailure(ENUM_TRANSPORT_ERROR err, const string desc);
@@ -731,6 +744,11 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   CMqttClient* SetMaxReconnectAttempts(uint count = MQTT_DEFAULT_MAX_RECONNECT_ATTEMPTS);
   // 0 = unlimited (circuit breaker off)
   CMqttClient* SetMaxPacketsPerPoll(uint n = 50);  // 0 = unlimited; set e.g. 20 to cap event-loop hold time
+  CMqttClient* SetMaxDeferredTransportPackets(uint count = MQTT_DEFAULT_MAX_DEFERRED_TRANSPORT_PACKETS);
+  CMqttClient* SetMaxDeferredTransportBytes(uint bytes = MQTT_DEFAULT_MAX_DEFERRED_TRANSPORT_BYTES);
+  CMqttClient* SetMaxDeferredCallbackEvents(uint count = MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_EVENTS);
+  CMqttClient* SetMaxDeferredCallbackPayloadBytes(uint bytes = MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_PAYLOAD_BYTES);
+  CMqttClient* SetMaxDeferredCallbackPropertyBytes(uint bytes = MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_PROPERTY_BYTES);
   CMqttClient*
   SetMaxIncomingPacketSize(uint bytes);  // Cap incoming packet memory (default: 1 MB); override after construction
   CMqttClient* SetPingRespTimeout(uint seconds);  // Independent PINGRESP deadline (0 = same as keep-alive)
@@ -833,6 +851,7 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   //--- Security policy
   CMqttClient* SetAllowInsecurePlaintextTransport(bool allow = true);
   CMqttClient* SetAllowInsecurePlaintextAuth(bool allow = true);
+  CMqttClient* SetAllowMaskedServerFrames(bool allow = true);
 
   //--- Logging
   CMqttClient* SetLogLevel(ENUM_MQTT_LOG_LEVEL level);
@@ -908,7 +927,10 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   uint   GetQueuedPropertyBytes() const { return m_publish_queue.GetPropertyBytes(); }
   ulong  GetOldestQueuedMessageAgeMs() const;
   uint   GetCallbackBacklogCount() const { return m_msg_evt_count; }
+  uint   GetCallbackBacklogPayloadBytes() const { return (uint)ArraySize(m_msg_evt_pbuf); }
+  uint   GetCallbackBacklogPropertyBytes() const { return (uint)ArraySize(m_msg_evt_prop_buf); }
   uint   GetDeferredTransportBacklogCount() const { return m_deferred_transport_count; }
+  uint   GetDeferredTransportBacklogBytes() const { return m_deferred_transport_bytes; }
   int    GetLastFailureCode() const { return m_last_failure_code; }
   string GetLastFailureDescription() const { return m_last_failure_description; }
   ENUM_MQTT_FAILURE_CLASS GetLastFailureClass() const { return m_last_failure_class; }
@@ -1033,9 +1055,10 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   }
   ENUM_MQTT_TRUST_MODE TestGetEffectiveTrustMode() const { return m_effective_trust_mode; }
   void                 TestQueueDeferredTransportPacket(const uchar& pkt[]) {
-    _AppendPacketCopy(m_deferred_transport_pkts, m_deferred_transport_count, pkt);
+    _TryAppendDeferredTransportPacket(pkt);
   }
   uint TestGetDeferredTransportCount() const { return m_deferred_transport_count; }
+  uint TestGetDeferredTransportBytes() const { return m_deferred_transport_bytes; }
 #endif
 };
 
@@ -1098,6 +1121,9 @@ CMqttClient::CMqttClient() {
   m_draining_queue                       = false;
   m_last_queued_publish_handoff_complete = false;
   m_msg_evt_count                        = 0;
+  m_max_deferred_callback_events         = MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_EVENTS;
+  m_max_deferred_callback_payload_bytes  = MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_PAYLOAD_BYTES;
+  m_max_deferred_callback_property_bytes = MQTT_DEFAULT_MAX_DEFERRED_CALLBACK_PROPERTY_BYTES;
   m_pending_replay_count                 = 0;
   m_replay_in_progress                   = false;
   m_replay_next_index                    = 0;
@@ -1232,6 +1258,9 @@ CMqttClient::CMqttClient() {
   m_pubcomp_tmpl[1] = 0x02;
   m_pubcomp_tmpl[2] = 0x00;
   m_pubcomp_tmpl[3] = 0x00;
+  m_deferred_transport_bytes = 0;
+  m_max_deferred_transport_packets = MQTT_DEFAULT_MAX_DEFERRED_TRANSPORT_PACKETS;
+  m_max_deferred_transport_bytes = MQTT_DEFAULT_MAX_DEFERRED_TRANSPORT_BYTES;
   //--- Cap incoming packet size at 1 MB by default.
   //--- The spec maximum (268,435,455 bytes) would allow a rogue broker to
   //--- send a 268 MB packet and crash MT5. 1 MB is ample for any trading payload.
@@ -1522,6 +1551,18 @@ bool CMqttClient::_TryComputeArrayAppendSize(uint current_size, uint append_size
 }
 
 //+------------------------------------------------------------------+
+//| _HandleBacklogOverflow                                           |
+//| Convert local backlog exhaustion into a fail-closed disconnect   |
+//| with a clear implementation-specific error reason.               |
+//+------------------------------------------------------------------+
+void CMqttClient::_HandleBacklogOverflow(const string desc) {
+  if (m_abort_current_poll) {
+    return;
+  }
+  _ProtocolDisconnect(MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR, desc);
+}
+
+//+------------------------------------------------------------------+
 //| _RemainingExpirySecondsFromDeadlineUs                            |
 //| Convert a monotonic microsecond deadline into MQTT whole seconds |
 //| while preserving sub-second remainder as 1 second.               |
@@ -1593,6 +1634,35 @@ void CMqttClient::_AppendPacketCopy(PacketBuffer& dest[], uint& dest_count, cons
 }
 
 //+------------------------------------------------------------------+
+//| _TryAppendDeferredTransportPacket                                |
+//| Preflight deferred transport growth before mutating backlog      |
+//| state so per-Poll clipping cannot grow without bounds.           |
+//+------------------------------------------------------------------+
+bool CMqttClient::_TryAppendDeferredTransportPacket(const uchar& pkt[]) {
+  uint pkt_bytes = (uint)ArraySize(pkt);
+
+  if (m_max_deferred_transport_packets > 0 && m_deferred_transport_count >= m_max_deferred_transport_packets) {
+    _HandleBacklogOverflow("Deferred transport backlog packet limit reached while clipping a Poll() burst");
+    return false;
+  }
+
+  int new_backlog_bytes = 0;
+  if (!_TryComputeArrayAppendSize(m_deferred_transport_bytes, pkt_bytes, new_backlog_bytes,
+                                  "Deferred transport backlog bytes")) {
+    _HandleBacklogOverflow("Deferred transport backlog exceeded local byte capacity");
+    return false;
+  }
+  if (m_max_deferred_transport_bytes > 0 && (uint)new_backlog_bytes > m_max_deferred_transport_bytes) {
+    _HandleBacklogOverflow("Deferred transport backlog byte limit reached while clipping a Poll() burst");
+    return false;
+  }
+
+  _AppendPacketCopy(m_deferred_transport_pkts, m_deferred_transport_count, pkt);
+  m_deferred_transport_bytes = (uint)new_backlog_bytes;
+  return true;
+}
+
+//+------------------------------------------------------------------+
 //| _AppendDeferredPackets - Queue extracted packets for next Poll   |
 //| when the per-call packet budget clips a busy burst after the     |
 //| transport already framed those packets. Preserves order without  |
@@ -1600,7 +1670,9 @@ void CMqttClient::_AppendPacketCopy(PacketBuffer& dest[], uint& dest_count, cons
 //+------------------------------------------------------------------+
 void CMqttClient::_AppendDeferredPackets(PacketBuffer& src[], uint start_idx, uint count) {
   for (uint i = 0; i < count; i++) {
-    _AppendPacketCopy(m_deferred_transport_pkts, m_deferred_transport_count, src[start_idx + i].data);
+    if (!_TryAppendDeferredTransportPacket(src[start_idx + i].data)) {
+      break;
+    }
   }
 }
 
@@ -1612,11 +1684,13 @@ void CMqttClient::_AppendDeferredPackets(PacketBuffer& src[], uint start_idx, ui
 void CMqttClient::_TakeDeferredPackets(PacketBuffer& out[], uint max_count, uint& out_count) {
   out_count = 0;
   uint take = m_deferred_transport_count;
+  uint taken_bytes = 0;
   if (max_count > 0 && take > max_count) {
     take = max_count;
   }
 
   for (uint i = 0; i < take; i++) {
+    taken_bytes += (uint)ArraySize(m_deferred_transport_pkts[i].data);
     _AppendPacketCopy(out, out_count, m_deferred_transport_pkts[i].data);
   }
 
@@ -1636,6 +1710,7 @@ void CMqttClient::_TakeDeferredPackets(PacketBuffer& out[], uint max_count, uint
   }
 
   m_deferred_transport_count = remaining;
+  m_deferred_transport_bytes = (taken_bytes > m_deferred_transport_bytes) ? 0 : (m_deferred_transport_bytes - taken_bytes);
   ArrayResize(m_deferred_transport_pkts, m_deferred_transport_count);
 }
 
@@ -1647,6 +1722,7 @@ void CMqttClient::_ClearDeferredTransportPackets() {
     ArrayFree(m_deferred_transport_pkts[i].data);
   }
   m_deferred_transport_count = 0;
+  m_deferred_transport_bytes = 0;
   ArrayResize(m_deferred_transport_pkts, 0);
 }
 
@@ -2083,9 +2159,10 @@ CMqttClient* CMqttClient::SetSessionExpiry(uint seconds) {
 //+------------------------------------------------------------------+
 //| SetSessionEncryptionPassphrase                                   |
 //| Purpose: Enable optional AES-256 at-rest encryption for the      |
-//|          persistent session database using a SHA-256-derived key |
-//|          and a SHA-256 integrity envelope. Pass an empty string  |
-//|          to disable it.                                          |
+//|          persistent session database using a single-pass         |
+//|          SHA-256 passphrase hash as the AES-256 key plus a       |
+//|          SHA-256 integrity envelope. Pass an empty string to     |
+//|          disable it.                                             |
 //+------------------------------------------------------------------+
 CMqttClient* CMqttClient::SetSessionEncryptionPassphrase(const string passphrase) {
   m_context.session_db.SetEncryptionPassphrase(passphrase);
@@ -2382,6 +2459,56 @@ CMqttClient* CMqttClient::SetQueueQoS0WhenDisconnected(bool enable) {
 //+------------------------------------------------------------------+
 CMqttClient* CMqttClient::SetMaxPacketsPerPoll(uint n) {
   m_max_packets_per_poll = n;
+  return GetPointer(this);
+}
+
+//+------------------------------------------------------------------+
+//| SetMaxDeferredTransportPackets                                   |
+//| Purpose: Cap deferred transport packets buffered across Poll()   |
+//|          calls when the per-call packet budget clips a burst.    |
+//+------------------------------------------------------------------+
+CMqttClient* CMqttClient::SetMaxDeferredTransportPackets(uint count) {
+  m_max_deferred_transport_packets = count;
+  return GetPointer(this);
+}
+
+//+------------------------------------------------------------------+
+//| SetMaxDeferredTransportBytes                                     |
+//| Purpose: Cap deferred transport bytes buffered across Poll()     |
+//|          calls when the per-call packet budget clips a burst.    |
+//+------------------------------------------------------------------+
+CMqttClient* CMqttClient::SetMaxDeferredTransportBytes(uint bytes) {
+  m_max_deferred_transport_bytes = bytes;
+  return GetPointer(this);
+}
+
+//+------------------------------------------------------------------+
+//| SetMaxDeferredCallbackEvents                                     |
+//| Purpose: Cap deferred callback events buffered across Poll()     |
+//|          calls while protocol work continues.                    |
+//+------------------------------------------------------------------+
+CMqttClient* CMqttClient::SetMaxDeferredCallbackEvents(uint count) {
+  m_max_deferred_callback_events = count;
+  return GetPointer(this);
+}
+
+//+------------------------------------------------------------------+
+//| SetMaxDeferredCallbackPayloadBytes                               |
+//| Purpose: Cap deferred callback payload bytes retained across     |
+//|          Poll() calls while callbacks are pending.               |
+//+------------------------------------------------------------------+
+CMqttClient* CMqttClient::SetMaxDeferredCallbackPayloadBytes(uint bytes) {
+  m_max_deferred_callback_payload_bytes = bytes;
+  return GetPointer(this);
+}
+
+//+------------------------------------------------------------------+
+//| SetMaxDeferredCallbackPropertyBytes                              |
+//| Purpose: Cap deferred callback property bytes retained across    |
+//|          Poll() calls while callbacks are pending.               |
+//+------------------------------------------------------------------+
+CMqttClient* CMqttClient::SetMaxDeferredCallbackPropertyBytes(uint bytes) {
+  m_max_deferred_callback_property_bytes = bytes;
   return GetPointer(this);
 }
 
@@ -2873,6 +3000,15 @@ CMqttClient* CMqttClient::SetAllowInsecurePlaintextTransport(bool allow) {
 //+------------------------------------------------------------------+
 CMqttClient* CMqttClient::SetAllowInsecurePlaintextAuth(bool allow) {
   m_allow_insecure_plaintext_auth = allow;
+  return GetPointer(this);
+}
+
+//+------------------------------------------------------------------+
+//| SetAllowMaskedServerFrames                                       |
+//| Purpose: Compatibility opt-in for non-compliant masked WS frames |
+//+------------------------------------------------------------------+
+CMqttClient* CMqttClient::SetAllowMaskedServerFrames(bool allow) {
+  m_ws_transport.SetAllowMaskedServerFrames(allow);
   return GetPointer(this);
 }
 
@@ -6440,11 +6576,54 @@ void CMqttClient::ReportQueueError(int code, const string description) { _FireEr
 void CMqttClient::_QueueMessageCallback(MqttOnMessageCallback cb, const string topic, const uchar& payload[],
                                         int payload_len, uchar qos, bool retain_f, ushort packet_id,
                                         uint matched_sub_id, const uchar& publish_properties[]) {
-  if (cb == NULL) {
+  if (cb == NULL || m_abort_current_poll) {
     return;
   }
 
-  uint new_count = m_msg_evt_count + 1;
+  //--- Copy payload and properties now because the transport packet buffer is reused
+  //--- as soon as dispatch continues. Delivery can also spill into later Poll() calls
+  //--- when the per-call budget limits how many callbacks can run immediately.
+  uint payload_bytes        = (payload_len > 0) ? (uint)payload_len : 0;
+  uint payload_off          = (uint)ArraySize(m_msg_evt_pbuf);
+  int  new_payload_buf_size = 0;
+  int  new_count_int        = 0;
+  if (!_TryComputeArrayAppendSize(m_msg_evt_count, 1, new_count_int, "Deferred callback event count")) {
+    _HandleBacklogOverflow("Deferred callback backlog exceeded local event capacity");
+    return;
+  }
+  uint new_count = (uint)new_count_int;
+  if (m_max_deferred_callback_events > 0 && new_count > m_max_deferred_callback_events) {
+    _HandleBacklogOverflow("Deferred callback backlog count limit reached while dispatch was deferred");
+    return;
+  }
+  if (payload_bytes > 0) {
+    if (!_TryComputeArrayAppendSize(payload_off, payload_bytes, new_payload_buf_size,
+                                    "Deferred callback payload buffer")) {
+      _HandleBacklogOverflow("Deferred callback payload backlog exceeded local byte capacity");
+      return;
+    }
+    if (m_max_deferred_callback_payload_bytes > 0 &&
+        (uint)new_payload_buf_size > m_max_deferred_callback_payload_bytes) {
+      _HandleBacklogOverflow("Deferred callback payload backlog limit reached while dispatch was deferred");
+      return;
+    }
+  }
+
+  uint prop_bytes        = (uint)ArraySize(publish_properties);
+  uint prop_off          = (uint)ArraySize(m_msg_evt_prop_buf);
+  int  new_prop_buf_size = 0;
+  if (prop_bytes > 0) {
+    if (!_TryComputeArrayAppendSize(prop_off, prop_bytes, new_prop_buf_size, "Deferred callback property buffer")) {
+      _HandleBacklogOverflow("Deferred callback property backlog exceeded local byte capacity");
+      return;
+    }
+    if (m_max_deferred_callback_property_bytes > 0 &&
+        (uint)new_prop_buf_size > m_max_deferred_callback_property_bytes) {
+      _HandleBacklogOverflow("Deferred callback property backlog limit reached while dispatch was deferred");
+      return;
+    }
+  }
+
   ArrayResize(m_msg_evt_cb, new_count, 8);
   ArrayResize(m_msg_evt_topic, new_count, 8);
   ArrayResize(m_msg_evt_qos, new_count, 8);
@@ -6455,33 +6634,11 @@ void CMqttClient::_QueueMessageCallback(MqttOnMessageCallback cb, const string t
   ArrayResize(m_msg_evt_plen, new_count, 8);
   ArrayResize(m_msg_evt_prop_off, new_count, 8);
   ArrayResize(m_msg_evt_prop_len, new_count, 8);
-
-  //--- Copy payload and properties now because the transport packet buffer is reused
-  //--- as soon as dispatch continues. Delivery can also spill into later Poll() calls
-  //--- when the per-call budget limits how many callbacks can run immediately.
-  uint payload_bytes        = (payload_len > 0) ? (uint)payload_len : 0;
-  uint payload_off          = (uint)ArraySize(m_msg_evt_pbuf);
-  int  new_payload_buf_size = 0;
   if (payload_bytes > 0) {
-    if (!_TryComputeArrayAppendSize(payload_off, payload_bytes, new_payload_buf_size,
-                                    "Deferred callback payload buffer")) {
-      _FireError(MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR,
-                 "Dropping message callback because the deferred payload buffer exceeded local capacity");
-      return;
-    }
     ArrayResize(m_msg_evt_pbuf, new_payload_buf_size, 256);
     ArrayCopy(m_msg_evt_pbuf, payload, (int)payload_off, 0, (int)payload_bytes);
   }
-
-  uint prop_bytes        = (uint)ArraySize(publish_properties);
-  uint prop_off          = (uint)ArraySize(m_msg_evt_prop_buf);
-  int  new_prop_buf_size = 0;
   if (prop_bytes > 0) {
-    if (!_TryComputeArrayAppendSize(prop_off, prop_bytes, new_prop_buf_size, "Deferred callback property buffer")) {
-      _FireError(MQTT_REASON_CODE_IMPLEMENTATION_SPECIFIC_ERROR,
-                 "Dropping message callback because the deferred property buffer exceeded local capacity");
-      return;
-    }
     ArrayResize(m_msg_evt_prop_buf, new_prop_buf_size, 128);
     ArrayCopy(m_msg_evt_prop_buf, publish_properties, (int)prop_off, 0, (int)prop_bytes);
   }
@@ -6866,6 +7023,10 @@ void CMqttClient::_PollInternal() {
     if (take_from_transport < transport_count) {
       _AppendDeferredPackets(transport_pkts, take_from_transport, transport_count - take_from_transport);
     }
+  }
+
+  if (m_abort_current_poll) {
+    return;
   }
 
   //--- Fatal transport errors

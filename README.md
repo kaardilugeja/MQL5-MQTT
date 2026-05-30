@@ -24,7 +24,7 @@ Everything else under `Include/MQTT/` should be treated as implementation detail
 - High-level `CMqttClient` facade for TCP, TLS, WebSocket, and WSS transports.
 - Session persistence, retransmission management, reconnect policy, topic alias handling, and queued publish support.
 - Curated unit, integration, regression, and compile-first public validation suites.
-- Public-safe harnesses and GitHub-facing documentation for compile and runtime validation.
+- Public-safe harnesses and GitHub-facing documentation for compile-first validation and local runtime bring-up.
 
 ## Repository Layout
 
@@ -136,7 +136,6 @@ If you want a checked-in runnable EA instead of copying the snippet manually, st
 | --- | --- | --- |
 | `Experts/MQTT/Harnesses/MinimalClientExample.mq5` | Basic publish or subscribe flow with timer-driven polling | Smallest runnable consumer example |
 | `Experts/MQTT/Harnesses/PublishQueueTestHarness.mq5` | Queue, expiry, retransmit, and offline-buffer behaviour | Broker-free runtime harness |
-| `Experts/MQTT/Harnesses/LiveBrokerSmoke.mq5` | End-to-end broker validation through `CMqttClient` | Pair with `Scripts/MQTT/Tools/run-mt5-live-broker-smoke.ps1` |
 
 For extra snippets and use-case guidance, use [Examples Guide](Include/MQTT/Documentation/Examples.md).
 
@@ -145,8 +144,7 @@ For extra snippets and use-case guidance, use [Examples Guide](Include/MQTT/Docu
 The supported public validation path stays intentionally small:
 
 1. Run the offline compile gate with `Tools/compile-public-validation.ps1`.
-2. Optionally enable the tracked raw CONNECT integration case through `Scripts/MQTT/Tests/LiveBrokerConfig.mqh`.
-3. Optionally run the checked-in client-level smoke with `Scripts/MQTT/Tools/run-mt5-live-broker-smoke.ps1` and `Experts/MQTT/Harnesses/LiveBrokerSmoke.mq5`.
+2. If you need broker-specific runtime follow-up after the compile gate, start from `Experts/MQTT/Harnesses/MinimalClientExample.mq5` and keep broker settings in local or ignored state instead of tracked files.
 
 If you want the detailed command lines and expected results, use [Validation Guide](Include/MQTT/Documentation/Validation.md). If you want the shortest clone-to-green path, use [Getting Started](Include/MQTT/Documentation/GettingStarted.md).
 
@@ -154,10 +152,8 @@ If you want the detailed command lines and expected results, use [Validation Gui
 
 This repository is checked in so that an IDE agent can validate a fresh clone without editing tracked machine-specific paths:
 
-- root `.editorconfig` and `.vscode/settings.json` provide portable editor and whitespace defaults
-- [AGENTS.md](AGENTS.md) points agents at the public include boundary and the checked-in validation scripts
 - `Tools/compile-public-validation.ps1` handles compile validation for both clone-local and synced-to-target MT5 roots
-- `Scripts/MQTT/Tools/run-mt5-live-broker-smoke.ps1` provides the optional broker-backed end-to-end smoke path
+- [IDE Automation Guide](Include/MQTT/Documentation/AutomationGuide.md) describes the supported compile-first workflow and how to approach local runtime follow-up without inventing missing helper scripts
 
 Give the agent your broker host, broker port, TLS or WSS requirements, optional credentials, and any non-default `METAEDITOR_PATH` or `MT5_TERMINAL_PATH`. For ready-to-use prompt templates, use [IDE Automation Guide](Include/MQTT/Documentation/AutomationGuide.md).
 

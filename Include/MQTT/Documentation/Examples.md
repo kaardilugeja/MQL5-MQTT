@@ -10,7 +10,6 @@ Start at [Documentation Home](README.md) if you want the broader docs map.
 | --- | --- | --- |
 | [MinimalClientExample.mq5](../../../Experts/MQTT/Harnesses/MinimalClientExample.mq5) | Basic publish flow, timer-driven polling, TLS or plaintext bring-up | Smallest runnable example |
 | [PublishQueueTestHarness.mq5](../../../Experts/MQTT/Harnesses/PublishQueueTestHarness.mq5) | Offline queue, resend, expiry, and queue coordinator behaviour | Broker-free runtime harness |
-| [LiveBrokerSmoke.mq5](../../../Experts/MQTT/Harnesses/LiveBrokerSmoke.mq5) | End-to-end broker proof with summary output | Best public broker validation harness |
 
 ## Minimal TLS Client
 
@@ -98,11 +97,6 @@ mqtt.SetQueueQoS0WhenDisconnected(false);
 
 This is the configuration family exercised by [PublishQueueTestHarness.mq5](../../../Experts/MQTT/Harnesses/PublishQueueTestHarness.mq5) and the unit tests behind it.
 
-## Broker Validation Harness
-
-Use [LiveBrokerSmoke.mq5](../../../Experts/MQTT/Harnesses/LiveBrokerSmoke.mq5) together with `Scripts/MQTT/Tools/run-mt5-live-broker-smoke.ps1` when you want a single command that compiles the harness, launches MT5, waits for a summary line, and shuts the terminal back down.
-
-That harness is the best public example when you need evidence that the full `CMqttClient` lifecycle works against a real broker.
 
 ## See Also
 

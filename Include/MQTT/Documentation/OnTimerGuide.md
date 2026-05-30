@@ -16,7 +16,7 @@ Start at [Documentation Home](README.md) if you want the broader docs map.
 6. checking CONNACK timeout
 7. flushing dirty session state to disk
 
-If you use persistent sessions and the local terminal storage contains sensitive routing or payload data, configure `SetSessionEncryptionPassphrase(...)` before `Connect()` so the flushed session file is protected at rest with AES-256 using a SHA-256-derived key and SHA-256 integrity envelope.
+If you use persistent sessions and the local terminal storage contains sensitive routing or payload data, configure `SetSessionEncryptionPassphrase(...)` before `Connect()` so the flushed session file is protected at rest with AES-256 using a single-pass SHA-256 passphrase hash and a SHA-256 integrity envelope. This is supplementary local-at-rest protection rather than a salted or iterated KDF or authenticated encryption scheme, so TLS or WSS remains the primary security boundary.
 
 ## Recommended Intervals
 

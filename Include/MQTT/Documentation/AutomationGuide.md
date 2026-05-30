@@ -25,10 +25,10 @@ The recommended agent workflow is:
 
 1. Run the offline compile gate first.
 2. Stop if the compile gate fails.
-3. Run the live smoke helper only after compile validation passes and you have provided broker access.
-4. Report the compile summary plus the smoke harness `SUMMARY status=...` line.
+3. For the shipped public validation path, report the compile summary and stop there.
+4. Treat any broker-specific runtime check as a local manual follow-up. Do not assume extra checked-in broker runtime automation or harness source files exist.
 
-That sequence uses the checked-in public scripts and avoids inventing custom local validation steps.
+That sequence stays within the tracked public surface and avoids inventing missing repository tooling.
 
 ## Compile-Only Prompt Template
 
@@ -38,42 +38,12 @@ Use a prompt like this with your IDE agent:
 Validate this MQL5 MQTT repository from a fresh clone. First run .\Tools\compile-public-validation.ps1 from the repo root. If MetaEditor is not in the default location, use METAEDITOR_PATH or the explicit path I provide. Summarize which targets passed or failed and do not edit tracked files unless a real repository issue is found.
 ```
 
-## Live Broker Prompt Template
+## Runtime Follow-Up Prompt Template
 
-Use a prompt like this when you want end-to-end broker proof after the compile gate passes:
+Use a prompt like this only after the compile gate passes and you want help with a local broker test that you control:
 
 ```text
-Validate this MQL5 MQTT repository against my broker. First run .\Tools\compile-public-validation.ps1. If that passes, run .\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 with these inputs: broker host=<HOST>, broker port=<PORT>, use TLS=<true|false>, use WebSocket=<true|false>, WebSocket path=<PATH>, username=<USER>, password=<PASSWORD>. If the repository is not my active MT5 MQL5 root, also use -TargetMql5Root and -SyncRepoToTarget. Report the compile summary and the final SUMMARY status line.
-```
-
-## Example Live Smoke Commands
-
-Native MQTT/TLS:
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 `
-  -ScenarioName live-smoke-tls8883 `
-  -BrokerHost broker.example.com `
-  -BrokerPort 8883 `
-  -UseTLS $true `
-  -RequireTLS $true `
-  -Username your-user `
-  -Password your-password
-```
-
-WSS:
-
-```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 `
-  -ScenarioName live-smoke-wss443 `
-  -BrokerHost broker.example.com `
-  -BrokerPort 443 `
-  -UseTLS $true `
-  -UseWebSocket $true `
-  -WebSocketPath /mqtt `
-  -RequireTLS $true `
-  -Username your-user `
-  -Password your-password
+The compile gate passed for this MQL5 MQTT repository. Help me adapt Experts/MQTT/Harnesses/MinimalClientExample.mq5 for a local broker test without assuming any extra shipped broker-runtime helper exists. Keep secrets out of tracked files and tell me which local values or terminal settings I still need to provide.
 ```
 
 ## Secret Handling
@@ -82,16 +52,16 @@ Do not ask the agent to save your broker secrets into tracked files.
 
 Prefer one of these approaches instead:
 
-- pass credentials directly on the command line to the live smoke helper
+- pass credentials directly to your local runtime command
 - keep credentials in ignored local shell history or local terminal environment variables
 - use locally edited ignored files, not tracked repository files
 
-Tracked files such as [LiveBrokerConfig.mqh](../../../Scripts/MQTT/Tests/LiveBrokerConfig.mqh) should stay on placeholder values in commits.
+Tracked example files should stay on placeholder values in commits.
 
 ## Expected Success Signals
 
 - Compile gate: the curated targets report `PASS`.
-- Live smoke: the result line reports `SUMMARY status=PASS`.
+- Any runtime follow-up is local and environment-specific; define the success condition in the prompt instead of assuming a shipped `SUMMARY` line.
 
 If compile succeeds but runtime fails immediately with `SocketConnect()` or MT5 error `4014`, use [Troubleshooting](Troubleshooting.md) before changing library code.
 

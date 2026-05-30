@@ -35,19 +35,17 @@ If your installation lives somewhere else, either:
 - pass `-MetaEditorPath` explicitly, or
 - set `METAEDITOR_PATH` before running the helper.
 
-## The Live Smoke Helper Uses The Wrong MT5 Data Root
+## Compile Validation Uses The Wrong MT5 Data Root
 
-When the repository checkout is not the same `MQL5` folder that your terminal actually uses, the harness may compile or launch against the wrong tree.
+When the repository checkout is not the same `MQL5` folder that your active terminal actually uses, compile validation may run against the wrong tree.
 
 Fix:
 
 ```powershell
-.\Scripts\MQTT\Tools\run-mt5-live-broker-smoke.ps1 `
+.\Tools\compile-public-validation.ps1 `
   -TargetMql5Root 'D:\MT5\MQL5' `
   -SyncRepoToTarget
 ```
-
-Use the same idea with `Tools/compile-public-validation.ps1` when you want compile validation against another MT5 root.
 
 ## `Publish()` Returns `MQTT_PUB_RECONNECTING` Or `MQTT_PUB_QUEUED`
 
@@ -80,7 +78,7 @@ Check the full chain:
 4. The subscription reaches `SUBACK`.
 5. The broker topic and QoS match what your harness expects.
 
-The live broker smoke harness is the easiest checked-in way to prove that end-to-end path.
+Start with the compile-first path, then reproduce the issue with [MinimalClientExample.mq5](../../../Experts/MQTT/Harnesses/MinimalClientExample.mq5) or your own local harness so broker-specific settings stay under your control.
 
 ## See Also
 
