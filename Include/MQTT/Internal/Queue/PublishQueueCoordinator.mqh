@@ -177,6 +177,15 @@ class CMqttPublishQueueCoordinator {
       }
 
       uint property_budget_len = ComputePropertyBudgetLen(queued[i].publish_properties, remaining_expiry);
+      ENUM_MQTT_QUEUE_ADMISSION admission = queue.EvaluateAdmission(queued[i].payload_size, property_budget_len);
+      if (admission != MQTT_QUEUE_ADMIT_OK) {
+        MQTT_LOG_WARN("Dropping durable queued publish during restore: "
+                      + DescribeAdmissionFailure(admission, queued[i].topic));
+        if (!FinalizeDurableMessage(session_db, queued[i].queued_id, error_text)) {
+          return false;
+        }
+        continue;
+      }
 
       if (!queue.Append(queued[i].topic, queued[i].payload, queued[i].payload_size, queued[i].qos_level,
                         queued[i].retain, queued[i].publish_properties, expiry_deadline_us,
@@ -215,20 +224,9 @@ class CMqttPublishQueueCoordinator {
       return false;
     }
 
-    //--- Write-through semantics: do not report MQTT_PUB_QUEUED until the durable row
-    //--- is both recorded and flushed, otherwise an EA restart could silently lose it.
+    //--- StoreOfflineQueuedMessage() is transactional and write-through in persistent
+    //--- mode, so a non-zero id here already means the durable row reached disk.
     queue.SetStoreId(queue.GetTotalCount() - 1, durable_store_id);
-    if (!session_db.FlushIfDirty(0)) {
-      string cleanup_error = "";
-      RemoveDurableMessage(session_db, durable_store_id, cleanup_error);
-      queue.RollbackTail(payload_size, property_budget_len);
-      error_text = "Failed to write through accepted offline QoS publish before returning MQTT_PUB_QUEUED";
-      if (StringLen(cleanup_error) > 0) {
-        error_text += "; " + cleanup_error;
-      }
-      return false;
-    }
-
     return true;
   }
 

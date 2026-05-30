@@ -68,7 +68,7 @@ During runtime validation:
 1. For TLS or WSS, call `SetTLS(true)` and `SetRequireTLS(true)` before `Connect()`.
 2. For WebSocket or WSS, use `SetHostWS(host, port, path)` instead of `SetHost()`.
 3. For plaintext transport on a trusted private network only, call `SetRequireTLS(false)` and explicitly opt in with `SetAllowInsecurePlaintextTransport(true)`.
-4. Guard publish activity with `IsSafeToPublish()` so your EA does not publish during reconnect or TLS setup.
+4. Guard publish activity with `IsSafeToPublish()` so your EA does not publish during reconnect, TLS setup, subscription replay, resumed QoS retransmission, or durable queue drain. `OnConnect()` now fires at the same ready boundary.
 
 For public release confidence, prefer the compile-first path plus a client-level runtime check over TLS, WSS, or another production-intended transport. The raw plaintext CONNECT smoke is useful for local diagnostics, but it is not the main publish-readiness signal.
 

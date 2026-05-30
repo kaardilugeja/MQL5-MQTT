@@ -13,7 +13,7 @@ Start at [Documentation Home](README.md) if you want the broader docs map.
 
 ## Minimal TLS Client
 
-Use this when you want the smallest production-shaped pattern: start connect attempts in `OnTimer()`, call `Poll()` every timer tick, and publish only after `IsSafeToPublish()` says the session is fully usable.
+Use this when you want the smallest production-shaped pattern: start connect attempts in `OnTimer()`, call `Poll()` every timer tick, and publish only after `IsSafeToPublish()` says the session is fully usable. That ready signal waits for replay, resumed QoS retransmission, durable queue drain, and then `OnConnect()`.
 
 ```mql5
 #include <MQTT\MQTT.mqh>

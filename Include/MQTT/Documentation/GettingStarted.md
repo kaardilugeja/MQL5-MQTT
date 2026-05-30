@@ -73,6 +73,13 @@ For a side-by-side comparison and extra snippets, use [Examples Guide](Examples.
 
 Use [IDE Automation Guide](AutomationGuide.md). It provides the exact inputs an IDE agent needs and prompt templates that work against the checked-in scripts without editing tracked secrets into the repository.
 
+## 7. Persistent-Session Operational Notes
+
+- `Poll()` is not only socket work. With persistent sessions enabled, normal QoS and reconnect bookkeeping can synchronously save session state on the chart thread during steady-state traffic.
+- `FlushSessionStateNow()` is usually redundant for those hot paths because they already write through immediately. Use it as a final checkpoint when you want to verify no deferred dirty state remains.
+- Incoming QoS 2 persistence failures increment a persisted circuit-breaker counter. The default threshold is `5` consecutive failures, configured with `SetIncomingStorageErrorMax(...)`.
+- Once that breaker trips, auto-reconnect stops until you fix the local storage problem and restart the EA. A later successful `CONNACK` resets the counter back to `0`.
+
 ## See Also
 
 - [Validation Guide](Validation.md)

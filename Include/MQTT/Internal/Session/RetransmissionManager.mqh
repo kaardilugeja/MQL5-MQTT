@@ -96,7 +96,8 @@ uint CRetransmissionManager::ProcessRetransmissions(CMqttContext &ctx, PacketBuf
     //--- Drop messages whose Message Expiry Interval has passed per §3.3.2.3.3.
     //--- A stale trading signal MUST NOT be retransmitted to subscribers who are now in
     //--- a different market state — this could cause stale signal execution.
-    if (stalled[i].expiry_time > 0 && TimeLocal() >= stalled[i].expiry_time) {
+    if ((stalled[i].expiry_mono_timestamp_us > 0 || stalled[i].expiry_time > 0)
+      && stalled[i].remaining_expiry_seconds == 0) {
       MQTT_LOG_INFO("Dropping expired message for packet ID " + (string)stalled[i].packet_id
                     + " — Message Expiry Interval exceeded per §3.3.2.3.3. Topic: " + stalled[i].topic);
       ctx.flow_control.ReleaseQoS(stalled[i].packet_id);
@@ -131,19 +132,8 @@ uint CRetransmissionManager::ProcessRetransmissions(CMqttContext &ctx, PacketBuf
       pub_builder.SetPayload(stalled[i].payload);
       pub_builder.SetRetain(stalled[i].retain);
       pub_builder.SetEncodedProperties(stalled[i].publish_properties);
-      if (stalled[i].expiry_time > 0) {
-        datetime now              = TimeLocal();
-        uint     remaining_expiry = 0;
-        if (stalled[i].expiry_time > now) {
-          datetime diff = stalled[i].expiry_time - now;
-          //--- MQTT Message Expiry Interval is a 32-bit value (max ~136 years).
-          //--- Guard against a corrupt DB entry with a far-future expiry timestamp
-          //--- that would silently overflow the uint cast.
-          if (diff <= (datetime)0xFFFFFFFF) {
-            remaining_expiry = (uint)diff;
-          }
-        }
-        pub_builder.SetMessageExpiryInterval(remaining_expiry);
+      if (stalled[i].expiry_mono_timestamp_us > 0 || stalled[i].expiry_time > 0) {
+        pub_builder.SetMessageExpiryInterval(stalled[i].remaining_expiry_seconds);
       }
       if (stalled[i].qos_level == QoS_1) {
         pub_builder.SetQoS_1(true);

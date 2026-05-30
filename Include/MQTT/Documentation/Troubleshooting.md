@@ -60,6 +60,8 @@ The intended public pattern is to call `Poll()` regularly and guard normal publi
 
 TLS and WSS handshakes use blocking MQL5 socket APIs. A short chart pause during initial connect or reconnect is expected.
 
+Persistent sessions can also add synchronous local disk I/O on normal QoS and reconnect bookkeeping paths. If you are profiling chart stalls, include session save latency in addition to socket timing.
+
 Fix or mitigation:
 
 - keep MQTT on a dedicated chart when latency matters
@@ -67,6 +69,23 @@ Fix or mitigation:
 - lower connect timeouts carefully if your environment is fast and stable
 
 For the timing model, see [OnTimer Guide](OnTimerGuide.md).
+
+## Auto-Reconnect Stops After Disk Problems Or QoS 2 Traffic
+
+Persistent incoming QoS 2 delivery writes session state locally before the client acknowledges the message. If that storage step keeps failing, the client deliberately stops reconnecting instead of looping forever through disconnect, reconnect, and the same broker resend.
+
+What to expect:
+
+- The default breaker threshold is `5` consecutive incoming-storage failures.
+- The counter is persisted across EA restarts.
+- A successful later `CONNACK` resets the counter to `0`.
+- Once the threshold is reached, auto-reconnect is disabled until you fix the storage problem and restart the EA.
+
+Fix:
+
+1. Free disk space or resolve the file-system error affecting the MT5 data folder.
+2. Restart the EA so auto-reconnect is re-enabled.
+3. If your deployment intentionally prefers repeated retry over fail-stop behavior, raise the threshold with `SetIncomingStorageErrorMax(...)` or disable the breaker with `SetIncomingStorageErrorMax(0)`.
 
 ## Incoming Messages Never Arrive
 

@@ -351,6 +351,8 @@ string                 g_cb_auth_ex_user_key               = "";
 string                 g_cb_auth_ex_user_val               = "";
 int                    g_reentrant_message_count           = 0;
 CMqttClient           *g_reentrant_client                  = NULL;
+CMqttClient           *g_connect_publish_client            = NULL;
+int                    g_connect_publish_result            = -999;
 
 //+------------------------------------------------------------------+
 //| ResetCallbackState                                               |
@@ -419,6 +421,8 @@ void                   ResetCallbackState() {
   g_cb_auth_ex_user_val               = "";
   g_reentrant_message_count           = 0;
   g_reentrant_client                  = NULL;
+  g_connect_publish_client            = NULL;
+  g_connect_publish_result            = -999;
 }
 
 //+------------------------------------------------------------------+
@@ -430,6 +434,15 @@ void                   ResetCallbackState() {
 void TestOnConnect(bool session_present) {
   g_cb_connect_count++;
   g_cb_session_present = session_present;
+}
+
+void TestOnConnectPublish(bool session_present) {
+  TestOnConnect(session_present);
+  if (g_connect_publish_client != NULL) {
+    uchar payload[] = {0xC1};
+    g_connect_publish_result = (int)g_connect_publish_client.Publish("resume/callback", payload, ArraySize(payload),
+                                                                     QoS_1, false);
+  }
 }
 
 //+------------------------------------------------------------------+
@@ -1951,6 +1964,97 @@ bool TEST_FlushSessionStateNowSucceedsWhenAlreadyDurable() {
 }
 
 //+------------------------------------------------------------------+
+//| TEST_OutgoingStoreRollbackOnSaveFailure                          |
+//| Failed write-through must not leave an outgoing row behind.      |
+//+------------------------------------------------------------------+
+bool TEST_OutgoingStoreRollbackOnSaveFailure() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_outgoing_store_rollback_on_save_failure";
+  ResetPersistentSessionStore(session_id);
+
+  CSessionDatabase db;
+  ASSERT_TRUE(db.Init(session_id, true));
+
+  ushort pktid = db.AllocatePacketId();
+  ASSERT_TRUE(pktid > 0);
+
+  uchar payload[] = {0x61, 0x62, 0x63};
+  db.TestForceSaveFailureOnce();
+  ASSERT_FALSE(db.StoreOutgoingMessage(pktid, QoS_1, "rollback/outgoing", payload, ArraySize(payload)));
+  ASSERT_TRUE(db.ReleasePacketId(pktid));
+
+  SessionMessage msg;
+  ASSERT_FALSE(db.GetMessage(pktid, msg));
+  ASSERT_EQ(0, (int)db.GetPendingMessageCount());
+  ASSERT_FALSE(db.IsDirty());
+
+  db.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_IncomingStoreRollbackOnSaveFailure                          |
+//| Failed incoming persistence must not leave a ghost QoS2 row.     |
+//+------------------------------------------------------------------+
+bool TEST_IncomingStoreRollbackOnSaveFailure() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_incoming_store_rollback_on_save_failure";
+  ResetPersistentSessionStore(session_id);
+
+  CSessionDatabase db;
+  ASSERT_TRUE(db.Init(session_id, true));
+
+  uchar payload[] = {0x71, 0x72};
+  db.TestForceSaveFailureOnce();
+  ASSERT_FALSE(db.StoreIncomingMessage(42, QoS_2, "rollback/incoming", payload, ArraySize(payload), false));
+
+  SessionMessage msg;
+  ASSERT_FALSE(db.GetMessage(42, msg, false));
+  ASSERT_EQ(0, (int)db.GetPendingMessageCount());
+  ASSERT_FALSE(db.IsDirty());
+
+  db.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_DurableQueueRollbackOnSaveFailure                           |
+//| Failed durable queue admission must roll back queue and DB state.|
+//+------------------------------------------------------------------+
+bool TEST_DurableQueueRollbackOnSaveFailure() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_durable_queue_rollback_on_save_failure";
+  ResetPersistentSessionStore(session_id);
+
+  CMqttClient mqtt;
+  uchar       payload[] = {0x41, 0x42};
+
+  mqtt.SetHost("broker.test", 1883);
+  mqtt.SetCleanStart(false);
+  mqtt.SetSessionExpiry(60);
+  ASSERT_TRUE(mqtt.TestContext().session_db.Init(session_id, true));
+
+  mqtt.TestContext().session_db.TestForceSaveFailureOnce();
+  ASSERT_EQ((int)MQTT_PUB_SEND_FAILED,
+            (int)mqtt.Publish("durable/rollback", payload, ArraySize(payload), QoS_1, false));
+  ASSERT_EQ(0, (int)mqtt.GetQueuedMessageCount());
+  ASSERT_EQ(0, (int)mqtt.GetDurableQueuedMessageCount());
+  ASSERT_FALSE(mqtt.TestContext().session_db.IsDirty());
+
+  CMqttClient restored;
+  ASSERT_TRUE(restored.TestContext().session_db.Init(session_id, true));
+  restored.TestRestorePersistedPublishQueue();
+  ASSERT_EQ(0, (int)restored.GetQueuedMessageCount());
+  ASSERT_EQ(0, (int)restored.GetDurableQueuedMessageCount());
+
+  restored.TestContext().session_db.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
 //| TEST_OfflineQueuedPublishSurvivesClientRestart                   |
 //| Persisted offline publishes must restore into a new facade       |
 //| instance and drain after reconnect.                              |
@@ -2005,9 +2109,164 @@ bool TEST_OfflineQueuedPublishSurvivesClientRestart() {
 }
 
 //+------------------------------------------------------------------+
-//| TEST_IncomingStorageErrorCountSurvivesClientRestart             |
-//| Persisted incoming-storage failures must restore and clear only |
-//| after a successful CONNACK.                                     |
+//| TEST_RestoreRespectsReducedQueueBudget                           |
+//| Durable restore must honor the current in-memory queue budgets.  |
+//+------------------------------------------------------------------+
+bool TEST_RestoreRespectsReducedQueueBudget() {
+  TEST_CASE_START();
+
+  const string session_id = "mqtt_test_restore_respects_reduced_budget";
+  ResetPersistentSessionStore(session_id);
+
+  {
+    CMqttClient phase1;
+    uchar       payload[] = {0x51, 0x52};
+
+    phase1.SetHost("broker.test", 1883);
+    phase1.SetCleanStart(false);
+    phase1.SetSessionExpiry(60);
+    ASSERT_TRUE(phase1.TestContext().session_db.Init(session_id, true));
+
+    ASSERT_EQ((int)MQTT_PUB_QUEUED,
+              (int)phase1.Publish("restore/first", payload, ArraySize(payload), QoS_1, false));
+    ASSERT_EQ((int)MQTT_PUB_QUEUED,
+              (int)phase1.Publish("restore/second", payload, ArraySize(payload), QoS_1, false));
+    ASSERT_EQ(2, (int)phase1.GetQueuedMessageCount());
+    ASSERT_EQ(2, (int)phase1.GetDurableQueuedMessageCount());
+  }
+
+  CTestTransport tx;
+  CMqttClient    phase2;
+
+  ASSERT_TRUE(phase2.TestContext().session_db.Init(session_id, true));
+  phase2.SetMaxQueuedMessages(1);
+  phase2.TestRestorePersistedPublishQueue();
+
+  ASSERT_EQ(1, (int)phase2.GetQueuedMessageCount());
+  ASSERT_EQ(1, (int)phase2.GetDurableQueuedMessageCount());
+
+  phase2.TestInjectTransport(GetPointer(tx));
+  phase2.TestSetState(MQTT_CLIENT_CONNECTED);
+  phase2.TestDrainPublishQueue();
+
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+  CPublish restored_pub;
+  ASSERT_EQ((int)MQTT_OK, restored_pub.Read(tx.m_sent[0].data));
+  ASSERT_STR_EQ("restore/first", restored_pub.GetTopicName());
+
+  phase2.TestContext().session_db.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_OnConnectPublishesAfterResumeBacklog                        |
+//| OnConnect-originated publishes must follow resumed backlog sends.|
+//+------------------------------------------------------------------+
+bool TEST_OnConnectPublishesAfterResumeBacklog() {
+  TEST_CASE_START();
+
+  const string client_id  = "test_on_connect_publish_order";
+  const string session_id = "mqtt_" + client_id;
+  ResetPersistentSessionStore(session_id);
+
+  {
+    CMqttClient phase1;
+    uchar       inflight_payload[] = {0x41};
+    uchar       queued_payload[]   = {0x42};
+
+    phase1.SetHost("broker.test", 1883);
+    phase1.SetClientId(client_id);
+    phase1.SetCleanStart(false);
+    phase1.SetSessionExpiry(60);
+    ASSERT_TRUE(phase1.TestContext().session_db.Init(session_id, true));
+
+    ushort pktid = phase1.TestContext().session_db.AllocatePacketId();
+    ASSERT_TRUE(pktid > 0);
+    ASSERT_TRUE(phase1.TestContext().session_db.StoreOutgoingMessage(pktid, QoS_1, "resume/inflight",
+                                                                     inflight_payload, ArraySize(inflight_payload)));
+    ASSERT_EQ((int)MQTT_PUB_QUEUED,
+              (int)phase1.Publish("resume/queued", queued_payload, ArraySize(queued_payload), QoS_1, false));
+  }
+
+  CTestTransport tx;
+  CMqttClient    phase2;
+
+  phase2.SetHost("broker.test", 1883);
+  phase2.SetClientId(client_id);
+  phase2.SetCleanStart(false);
+  phase2.SetSessionExpiry(60);
+  phase2.SetOnConnect(TestOnConnectPublish);
+  phase2.TestInjectTransport(GetPointer(tx));
+
+  g_connect_publish_client = &phase2;
+  ASSERT_EQ((int)TRANSPORT_CONNECTING, (int)phase2.Connect());
+  tx.ClearSentPackets();
+
+  uchar connack_pkt[] = {0x20, 0x03, 0x01, 0x00, 0x00};
+  tx.EnqueueIncoming(connack_pkt);
+  phase2.Poll();
+
+  ASSERT_EQ(1, g_cb_connect_count);
+  ASSERT_EQ((int)MQTT_PUB_OK, g_connect_publish_result);
+  ASSERT_EQ(3, (int)tx.m_sent_count);
+
+  CPublish first;
+  CPublish second;
+  CPublish third;
+  ASSERT_EQ((int)MQTT_OK, first.Read(tx.m_sent[0].data));
+  ASSERT_EQ((int)MQTT_OK, second.Read(tx.m_sent[1].data));
+  ASSERT_EQ((int)MQTT_OK, third.Read(tx.m_sent[2].data));
+  ASSERT_STR_EQ("resume/inflight", first.GetTopicName());
+  ASSERT_STR_EQ("resume/queued", second.GetTopicName());
+  ASSERT_STR_EQ("resume/callback", third.GetTopicName());
+
+  phase2.TestContext().session_db.Clear();
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_OnConnectWaitsForReplaySuback                               |
+//| Publish-ready state & OnConnect must wait for replay quiescence. |
+//+------------------------------------------------------------------+
+bool TEST_OnConnectWaitsForReplaySuback() {
+  TEST_CASE_START();
+
+  CTestTransport tx;
+  CMqttClient    mqtt;
+
+  mqtt.SetHost("broker.test", 1883);
+  mqtt.SetCleanStart(true);
+  mqtt.SetOnConnect(TestOnConnect);
+  mqtt.Subscribe("replay/delayed", QoS_1);
+  mqtt.TestInjectTransport(GetPointer(tx));
+
+  ASSERT_EQ((int)TRANSPORT_CONNECTING, (int)mqtt.Connect());
+  tx.ClearSentPackets();
+
+  uchar connack_pkt[] = {0x20, 0x03, 0x00, 0x00, 0x00};
+  tx.EnqueueIncoming(connack_pkt);
+  mqtt.Poll();
+
+  ASSERT_EQ((int)MQTT_CLIENT_CONNECTED, (int)mqtt.GetState());
+  ASSERT_FALSE(mqtt.IsSafeToPublish());
+  ASSERT_EQ(0, g_cb_connect_count);
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+
+  ushort replay_pktid = (ushort)(((uint)tx.m_sent[0].data[2] << 8) | (uint)tx.m_sent[0].data[3]);
+  uchar  suback_pkt[] = {0x90, 0x04, (uchar)(replay_pktid >> 8), (uchar)(replay_pktid & 0xFF), 0x00, 0x01};
+  tx.EnqueueIncoming(suback_pkt);
+  mqtt.Poll();
+
+  ASSERT_TRUE(mqtt.IsSafeToPublish());
+  ASSERT_EQ(1, g_cb_connect_count);
+
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_IncomingStorageErrorCountSurvivesClientRestart              |
+//| Persisted incoming-storage failures must restore and clear only  |
+//| after a successful CONNACK.                                      |
 //+------------------------------------------------------------------+
 bool TEST_IncomingStorageErrorCountSurvivesClientRestart() {
   TEST_CASE_START();
@@ -2050,9 +2309,9 @@ bool TEST_IncomingStorageErrorCountSurvivesClientRestart() {
 }
 
 //+------------------------------------------------------------------+
-//| TEST_EncryptedSessionRoundTrip                                  |
-//| Encrypted session files must save and restore with the same     |
-//| passphrase and mark the persisted file as encrypted.            |
+//| TEST_EncryptedSessionRoundTrip                                   |
+//| Encrypted session files must save and restore with the same      |
+//| passphrase and mark the persisted file as encrypted.             |
 //+------------------------------------------------------------------+
 bool TEST_EncryptedSessionRoundTrip() {
   TEST_CASE_START();
@@ -2093,9 +2352,9 @@ bool TEST_EncryptedSessionRoundTrip() {
 }
 
 //+------------------------------------------------------------------+
-//| TEST_EncryptedSessionWrongPassphraseFailsLoad                   |
-//| Loading with the wrong passphrase must fail without restoring   |
-//| persisted message state.                                        |
+//| TEST_EncryptedSessionWrongPassphraseFailsLoad                    |
+//| Loading with the wrong passphrase must fail without restoring    |
+//| persisted message state.                                         |
 //+------------------------------------------------------------------+
 bool TEST_EncryptedSessionWrongPassphraseFailsLoad() {
   TEST_CASE_START();
@@ -2124,9 +2383,9 @@ bool TEST_EncryptedSessionWrongPassphraseFailsLoad() {
 }
 
 //+------------------------------------------------------------------+
-//| TEST_EncryptedSessionTamperFailsLoad                            |
-//| Ciphertext tampering must prevent the persisted session from    |
-//| loading even with the correct passphrase.                       |
+//| TEST_EncryptedSessionTamperFailsLoad                             |
+//| Ciphertext tampering must prevent the persisted session from     |
+//| loading even with the correct passphrase.                        |
 //+------------------------------------------------------------------+
 bool TEST_EncryptedSessionTamperFailsLoad() {
   TEST_CASE_START();
@@ -2209,6 +2468,94 @@ bool TEST_RetransmitPreservesPublishProperties() {
   ASSERT_STR_EQ("text/plain", retransmit.GetContentType());
   ASSERT_TRUE(retransmit.HasMessageExpiry());
   ASSERT_TRUE((int)retransmit.GetMessageExpiryInterval() > 0);
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_RetransmitIgnoresStaleWallClockExpiry                       |
+//| Monotonic expiry tracking must win over stale wall-clock time.   |
+//+------------------------------------------------------------------+
+bool TEST_RetransmitIgnoresStaleWallClockExpiry() {
+  TEST_CASE_START();
+
+  CTestTransport        tx;
+  CMqttClient           mqtt;
+  MqttPublishProperties props;
+
+  InitPublishProperties(props);
+
+  mqtt.TestInjectTransport(GetPointer(tx));
+  mqtt.TestSetState(MQTT_CLIENT_CONNECTED);
+  mqtt.SetRetransmitTimeout(0);
+
+  props.has_message_expiry      = true;
+  props.message_expiry_interval = 60;
+
+  ASSERT_EQ((int)MQTT_PUB_OK, (int)mqtt.Publish("expiry/mono/live", "again", QoS_1, false, props));
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+
+  CPublish initial;
+  ASSERT_EQ((int)MQTT_OK, initial.Read(tx.m_sent[0].data));
+  ushort packet_id = initial.GetPacketId();
+  tx.ClearSentPackets();
+
+  ulong    now_us   = GetMicrosecondCount();
+  datetime now_time = TimeLocal();
+  mqtt.TestContext().session_db.TestSetMessageTiming(packet_id, true, now_us, now_time - 3600, now_us, 60);
+
+  mqtt.TestRunRetransmissions(0);
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+
+  CPublish retransmit;
+  ASSERT_EQ((int)MQTT_OK, retransmit.Read(tx.m_sent[0].data));
+  ASSERT_TRUE(retransmit.HasMessageExpiry());
+  ASSERT_TRUE((int)retransmit.GetMessageExpiryInterval() >= 59);
+  ASSERT_TRUE((int)retransmit.GetMessageExpiryInterval() <= 60);
+
+  SessionMessage stored;
+  ASSERT_TRUE(mqtt.TestContext().session_db.GetMessage(packet_id, stored));
+  ASSERT_TRUE(stored.remaining_expiry_seconds >= 59);
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST_RetransmitDropsExpiredByMonotonicBudget                     |
+//| A future wall clock must not keep an already expired message.    |
+//+------------------------------------------------------------------+
+bool TEST_RetransmitDropsExpiredByMonotonicBudget() {
+  TEST_CASE_START();
+
+  CTestTransport        tx;
+  CMqttClient           mqtt;
+  MqttPublishProperties props;
+
+  InitPublishProperties(props);
+
+  mqtt.TestInjectTransport(GetPointer(tx));
+  mqtt.TestSetState(MQTT_CLIENT_CONNECTED);
+  mqtt.SetRetransmitTimeout(0);
+
+  props.has_message_expiry      = true;
+  props.message_expiry_interval = 60;
+
+  ASSERT_EQ((int)MQTT_PUB_OK, (int)mqtt.Publish("expiry/mono/drop", "again", QoS_1, false, props));
+  ASSERT_EQ(1, (int)tx.m_sent_count);
+
+  CPublish initial;
+  ASSERT_EQ((int)MQTT_OK, initial.Read(tx.m_sent[0].data));
+  ushort packet_id = initial.GetPacketId();
+  tx.ClearSentPackets();
+
+  ulong    now_us   = GetMicrosecondCount();
+  datetime now_time = TimeLocal();
+  mqtt.TestContext().session_db.TestSetMessageTiming(packet_id, true, now_us, now_time + 3600,
+                                                     now_us - 2000000ULL, 1);
+
+  mqtt.TestRunRetransmissions(0);
+  ASSERT_EQ(0, (int)tx.m_sent_count);
+
+  SessionMessage stored;
+  ASSERT_FALSE(mqtt.TestContext().session_db.GetMessage(packet_id, stored));
   return true;
 }
 
@@ -4776,13 +5123,21 @@ void OnStart() {
   REGISTER_TEST(TEST_QueuedPublishExpiryRoundsUpOnDrain)
   REGISTER_TEST(TEST_DurableQueuedPublishCountSurface)
   REGISTER_TEST(TEST_FlushSessionStateNowSucceedsWhenAlreadyDurable)
+  REGISTER_TEST(TEST_OutgoingStoreRollbackOnSaveFailure)
+  REGISTER_TEST(TEST_IncomingStoreRollbackOnSaveFailure)
+  REGISTER_TEST(TEST_DurableQueueRollbackOnSaveFailure)
   REGISTER_TEST(TEST_OfflineQueuedPublishSurvivesClientRestart)
+  REGISTER_TEST(TEST_RestoreRespectsReducedQueueBudget)
+  REGISTER_TEST(TEST_OnConnectPublishesAfterResumeBacklog)
+  REGISTER_TEST(TEST_OnConnectWaitsForReplaySuback)
   REGISTER_TEST(TEST_IncomingStorageErrorCountSurvivesClientRestart)
   REGISTER_TEST(TEST_EncryptedSessionRoundTrip)
   REGISTER_TEST(TEST_EncryptedSessionWrongPassphraseFailsLoad)
   REGISTER_TEST(TEST_EncryptedSessionTamperFailsLoad)
   REGISTER_TEST(TEST_FlatBufferAppendSizeRejectsOverflow)
   REGISTER_TEST(TEST_RetransmitPreservesPublishProperties)
+  REGISTER_TEST(TEST_RetransmitIgnoresStaleWallClockExpiry)
+  REGISTER_TEST(TEST_RetransmitDropsExpiredByMonotonicBudget)
   REGISTER_TEST(TEST_DiagnosticsCallbacksSurfaceMetadata)
   REGISTER_TEST(TEST_OutgoingAckDiagnosticsSurface)
   REGISTER_TEST(TEST_ImmediateConnectFailurePreservesReconnect)
@@ -4962,8 +5317,20 @@ void OnStart() {
       result = TEST_DurableQueuedPublishCountSurface();
     } else if (test_names[i] == "TEST_FlushSessionStateNowSucceedsWhenAlreadyDurable") {
       result = TEST_FlushSessionStateNowSucceedsWhenAlreadyDurable();
+    } else if (test_names[i] == "TEST_OutgoingStoreRollbackOnSaveFailure") {
+      result = TEST_OutgoingStoreRollbackOnSaveFailure();
+    } else if (test_names[i] == "TEST_IncomingStoreRollbackOnSaveFailure") {
+      result = TEST_IncomingStoreRollbackOnSaveFailure();
+    } else if (test_names[i] == "TEST_DurableQueueRollbackOnSaveFailure") {
+      result = TEST_DurableQueueRollbackOnSaveFailure();
     } else if (test_names[i] == "TEST_OfflineQueuedPublishSurvivesClientRestart") {
       result = TEST_OfflineQueuedPublishSurvivesClientRestart();
+    } else if (test_names[i] == "TEST_RestoreRespectsReducedQueueBudget") {
+      result = TEST_RestoreRespectsReducedQueueBudget();
+    } else if (test_names[i] == "TEST_OnConnectPublishesAfterResumeBacklog") {
+      result = TEST_OnConnectPublishesAfterResumeBacklog();
+    } else if (test_names[i] == "TEST_OnConnectWaitsForReplaySuback") {
+      result = TEST_OnConnectWaitsForReplaySuback();
     } else if (test_names[i] == "TEST_IncomingStorageErrorCountSurvivesClientRestart") {
       result = TEST_IncomingStorageErrorCountSurvivesClientRestart();
     } else if (test_names[i] == "TEST_EncryptedSessionRoundTrip") {
@@ -4976,6 +5343,10 @@ void OnStart() {
       result = TEST_FlatBufferAppendSizeRejectsOverflow();
     } else if (test_names[i] == "TEST_RetransmitPreservesPublishProperties") {
       result = TEST_RetransmitPreservesPublishProperties();
+    } else if (test_names[i] == "TEST_RetransmitIgnoresStaleWallClockExpiry") {
+      result = TEST_RetransmitIgnoresStaleWallClockExpiry();
+    } else if (test_names[i] == "TEST_RetransmitDropsExpiredByMonotonicBudget") {
+      result = TEST_RetransmitDropsExpiredByMonotonicBudget();
     } else if (test_names[i] == "TEST_DiagnosticsCallbacksSurfaceMetadata") {
       result = TEST_DiagnosticsCallbacksSurfaceMetadata();
     } else if (test_names[i] == "TEST_OutgoingAckDiagnosticsSurface") {

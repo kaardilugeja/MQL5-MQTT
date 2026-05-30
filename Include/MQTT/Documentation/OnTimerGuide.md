@@ -16,6 +16,8 @@ Start at [Documentation Home](README.md) if you want the broader docs map.
 6. checking CONNACK timeout
 7. flushing dirty session state to disk
 
+For persistent sessions, some QoS and reconnect bookkeeping paths also perform synchronous write-through session saves on the chart thread instead of waiting for a later flush pass. Treat that as part of the normal `Poll()` cost model, not as a rare maintenance path.
+
 If you use persistent sessions and the local terminal storage contains sensitive routing or payload data, configure `SetSessionEncryptionPassphrase(...)` before `Connect()` so the flushed session file is protected at rest with AES-256 using a single-pass SHA-256 passphrase hash and a SHA-256 integrity envelope. This is supplementary local-at-rest protection rather than a salted or iterated KDF or authenticated encryption scheme, so TLS or WSS remains the primary security boundary.
 
 ## Recommended Intervals
@@ -76,8 +78,13 @@ Each `Poll()` call typically involves:
 - packet framing and dispatch
 - keep-alive checks
 - occasional session database flush checks
+- synchronous session write-through work when persistent-session QoS or reconnect state changes
 
-The read timeout is usually the dominant cost. If no data is available, `SocketRead()` can block up to the configured read timeout. That means an `OnTimer()` interval lower than the read timeout often provides diminishing returns.
+The read timeout is often the dominant idle-path cost. If no data is available, `SocketRead()` can block up to the configured read timeout. That means an `OnTimer()` interval lower than the read timeout often provides diminishing returns.
+
+Persistent sessions change the steady-state picture. Outgoing QoS stores, incoming QoS 2 stores, durable offline-queue admission, and reconnect-failure counter updates can all serialize the session database synchronously instead of deferring work to a later flush. On a busy chart, disk latency can therefore become visible even when socket reads are fast.
+
+`FlushSessionStateNow()` is additive only when the session database is still dirty. On most persistent-session hot paths it is redundant because those mutations already wrote through before `Poll()` returned. It is mainly useful as a last checkpoint before shutdown or after any future code path that intentionally leaves deferred dirty state behind.
 
 If you deliberately want lower latency, reduce the transport read timeout first and then tighten the timer.
 
@@ -88,6 +95,8 @@ QoS 1 and QoS 2 retransmission checks run on every `Poll()` call while the clien
 Auto-reconnect backoff is also checked on each `Poll()` call while disconnected. A slower timer means reconnect attempts may land slightly after the scheduled backoff target, which is usually acceptable.
 
 The default reconnect circuit breaker is `12` consecutive attempts. Use `SetMaxReconnectAttempts(0)` only when unlimited retry is an intentional operator choice.
+
+Incoming QoS 2 persistence has a separate circuit breaker. After `5` consecutive local storage failures by default, the client disconnects, stops auto-reconnect, and requires an EA restart after the disk or file-system problem is fixed. The failure counter is persisted across restarts and resets only after a later successful `CONNACK`. Use `SetIncomingStorageErrorMax(...)` to tune that threshold, or `SetIncomingStorageErrorMax(0)` only when infinite retry loops are an explicit operator choice.
 
 ## TLS And WSS Blocking Limitation
 

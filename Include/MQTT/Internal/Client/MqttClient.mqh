@@ -336,6 +336,9 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   uint                   m_pending_replay_count;  // Number of replay SUBSCRIBE batches awaiting SUBACK.
   bool                   m_replay_in_progress;    // True while reconnect-time subscription replay is active.
   uint                   m_replay_next_index;     // Next subscription index to batch into replay.
+  bool                   m_post_connect_pending;  // Delay OnConnect/publish-safe until resume work completes.
+  bool                   m_post_connect_waits_for_replay;  // True when replay SUBACKs must quiesce first.
+  bool                   m_publish_ready;  // True once replay, retransmissions, and queue drain are complete.
 
   //--- Pending UNSUBSCRIBE tracking
   ushort                 m_punsub_pkt_id[];
@@ -585,6 +588,7 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
   void                    _RememberFailure(int code, const string desc);
   bool                    _IsRedirectHostAllowed(const string host) const;
   void                    _ReplaySubscriptions();
+  void                    _MaybeFinalizePostConnect();
   void                    _RunRetransmissions(uint timeout_seconds = 30);
   void                    _PurgeExpiredQueuedPublishes();
   void                    _DrainPublishQueue();
@@ -903,7 +907,7 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
     return m_state == MQTT_CLIENT_CONNECTING || m_state == MQTT_CLIENT_WAITING_CONNACK
         || m_state == MQTT_CLIENT_TLS_HANDSHAKING;  // TLS upgrade phase
   }
-  bool IsSafeToPublish() const { return m_state == MQTT_CLIENT_CONNECTED; }
+  bool IsSafeToPublish() const { return m_state == MQTT_CLIENT_CONNECTED && m_publish_ready; }
   bool FlushSessionStateNow() { return !m_context.session_db.IsDirty() || m_context.session_db.FlushIfDirty(0); }
   ENUM_MQTT_CLIENT_STATE GetState() const { return m_state; }
 
@@ -998,7 +1002,12 @@ class CMqttClient : public IMqttPublishQueueDrainSink {
       m_test_transport_injected = true;
     }
   }
-  void TestSetState(ENUM_MQTT_CLIENT_STATE state) { m_state = state; }
+  void TestSetState(ENUM_MQTT_CLIENT_STATE state) {
+    m_state                          = state;
+    m_post_connect_pending           = false;
+    m_post_connect_waits_for_replay  = false;
+    m_publish_ready                  = (state == MQTT_CLIENT_CONNECTED);
+  }
   void TestStartReconnect() { m_reconnect_policy.StartLoopIfNeeded(); }
   bool TestIsReconnecting() const { return m_reconnect_policy.IsReconnecting(); }
   uint TestGetReconnectBackoff() const { return m_reconnect_policy.GetCurrentBackoff(); }
@@ -1127,6 +1136,9 @@ CMqttClient::CMqttClient() {
   m_pending_replay_count                 = 0;
   m_replay_in_progress                   = false;
   m_replay_next_index                    = 0;
+  m_post_connect_pending                 = false;
+  m_post_connect_waits_for_replay        = false;
+  m_publish_ready                        = false;
   m_pending_unsub_count                  = 0;
   m_deferred_transport_count             = 0;
   m_state                                = MQTT_CLIENT_DISCONNECTED;
@@ -1415,6 +1427,11 @@ void CMqttClient::_SetState(ENUM_MQTT_CLIENT_STATE new_state) {
   }
   ENUM_MQTT_CLIENT_STATE old_state = m_state;
   m_state                          = new_state;
+  if (new_state != MQTT_CLIENT_CONNECTED) {
+    m_post_connect_pending          = false;
+    m_post_connect_waits_for_replay = false;
+    m_publish_ready                 = false;
+  }
   if (m_on_state_change != NULL) {
     m_on_state_change(old_state, new_state);
     _SyncLogger();  // ARCH-003: restore this instance's log config after callback
@@ -5604,26 +5621,51 @@ void CMqttClient::_OnConnackReceived(uchar& pkt[]) {
   //--- Replay is only skipped when session_present=true AND clean_start=false.
   //--- Call SetAlwaysReplaySubscriptions(true) to restore unconditional replay
   //--- (e.g., for bridging scenarios or conservative interop with non-compliant brokers).
+  bool requires_replay             = (!session_present || m_clean_start || m_always_replay_subscriptions);
+  m_post_connect_pending           = true;
+  m_post_connect_waits_for_replay  = requires_replay;
+  m_publish_ready                  = false;
+
   //--- Replay must complete before the on_connect callback fires so that any new
   //--- Subscribe() calls inside the callback are not replayed a second time.
-  if (!session_present || m_clean_start || m_always_replay_subscriptions) {
+  if (requires_replay) {
     _ReplaySubscriptions();
   } else {
     MQTT_LOG_DEBUG("Session resumed (session_present=true) — skipping subscription replay per §4.1.");
   }
 
-  //--- Fire the connect callback after subscription replay so that Subscribe() calls
-  //--- inside the callback are not double-subscribed by a subsequent replay.
-  if (m_on_connect != NULL) {
-    m_on_connect(session_present);
-    _SyncLogger();  // Restore this instance's log config after callback
+  _MaybeFinalizePostConnect();
+}
+
+void CMqttClient::_MaybeFinalizePostConnect() {
+  if (!m_post_connect_pending || m_state != MQTT_CLIENT_CONNECTED) {
+    return;
   }
 
-  //--- Re-transmit any pending QoS 1/2 messages from session store
-  _RunRetransmissions(0);
+  if (m_post_connect_waits_for_replay) {
+    if (m_replay_in_progress || m_pending_replay_count > 0 || m_replay_next_index < m_sub_count) {
+      return;
+    }
+  }
 
-  //--- Drain backpressure queue
+  _RunRetransmissions(0);
+  if (m_abort_current_poll || m_state != MQTT_CLIENT_CONNECTED) {
+    return;
+  }
+
   _DrainPublishQueue();
+  if (m_abort_current_poll || m_state != MQTT_CLIENT_CONNECTED) {
+    return;
+  }
+
+  m_publish_ready                 = true;
+  m_post_connect_pending          = false;
+  m_post_connect_waits_for_replay = false;
+
+  if (m_on_connect != NULL) {
+    m_on_connect(m_connack_session_present);
+    _SyncLogger();
+  }
 }
 
 //+------------------------------------------------------------------+
@@ -6141,6 +6183,8 @@ void CMqttClient::_OnSubackReceived(uchar& pkt[]) {
                 m_last_suback_user_prop_vals, (int)m_last_suback_user_prop_count);
     _SyncLogger();
   }
+
+  _MaybeFinalizePostConnect();
 }
 //+------------------------------------------------------------------+
 void CMqttClient::_OnUnsubackReceived(uchar& pkt[]) {

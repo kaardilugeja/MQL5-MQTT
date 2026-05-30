@@ -42,7 +42,7 @@
 //--- Session file format version — increment whenever the layout changes.
 //--- Extend LoadFromFile with a staged reader before bumping so older
 //--- durable sessions are migrated forward instead of discarded.
-#define MQTT_SESSION_FILE_VERSION        7
+#define MQTT_SESSION_FILE_VERSION        8
 #define MQTT_SESSION_FILE_FLAG_ENCRYPTED 0x01
 #define MQTT_SESSION_ENVELOPE_MAGIC      0x53444245
 #define MQTT_SESSION_MAX_BODY_BYTES      16777216
@@ -76,6 +76,8 @@ struct SessionMessage {
   bool            is_outgoing;                   // true = client→broker state, false = broker→client QoS state.
   uint            retransmit_count;              // Number of retransmit attempts already consumed for this message.
   datetime        expiry_time;                   // Set to > 0 if there's an expiry limit
+  ulong           expiry_mono_timestamp_us;      // Monotonic baseline for expiry remaining-lifetime tracking.
+  uint            remaining_expiry_seconds;      // Remaining expiry budget captured when the message entered storage.
   uchar           priority;                      // 0 is lowest priority
   bool            retain;                        // Original retain flag from PUBLISH per §3.3.1.3
   bool  allow_outgoing_subscription_identifier;  // True when a stored Subscription Identifier may be replayed.
@@ -162,6 +164,7 @@ class CSessionDatabase {
   uint                 m_reconnect_failure_count;
   uint   m_incoming_storage_error_count;  // Consecutive incoming QoS2 persistence failures restored on load.
   uchar  m_session_encryption_key[];      // Single-pass SHA-256 passphrase hash used as the AES-256 key; empty = plaintext.
+  bool   m_test_force_save_failure_once;  // Test hook that forces the next SaveToFile() call to fail.
   bool   m_test_force_finalize_offline_fallback_once;  // Test hook that forces the finalize-fallback path once.
 
   //--- Private helper methods
@@ -190,6 +193,8 @@ class CSessionDatabase {
   bool   _ReadBufferBytes(const uchar& src[], int& offset, uint count, uchar& dest[]) const;
   bool   _ReadBufferUtf8String(const uchar& src[], int& offset, uint max_len, string& value) const;
   bool   _ReadFileBuffer(int handle, uint bytes_to_read, uchar& dest[]) const;
+  uint   _GetMessageRemainingExpirySeconds(const SessionMessage& msg, datetime now_time = 0, ulong now_us = 0) const;
+  bool   _IsMessageExpired(const SessionMessage& msg, datetime now_time = 0, ulong now_us = 0) const;
   uint   _GetOfflineRemainingExpirySeconds(const OfflineQueuedMessage& msg, datetime now_time = 0,
                                            ulong now_us = 0) const;
   bool   _IsOfflineQueuedMessageExpired(const OfflineQueuedMessage& msg, datetime now_time = 0, ulong now_us = 0) const;
@@ -286,6 +291,19 @@ class CSessionDatabase {
   void            PrintStatistics();
   uint            GetTotalAllocatedIds() const { return m_total_allocated_ids; }
   uint            GetTotalReleasedIds() const { return m_total_released_ids; }
+  void TestSetMessageTiming(const ushort packet_id, const bool is_outgoing, const ulong retransmit_mono_timestamp_us,
+                            const datetime expiry_time, const ulong expiry_mono_timestamp_us,
+                            const uint remaining_expiry_seconds) {
+    const int idx = FindMessageByPacketId(packet_id, is_outgoing);
+    if (idx < 0) {
+      return;
+    }
+    m_messages[idx].mono_timestamp_us        = retransmit_mono_timestamp_us;
+    m_messages[idx].expiry_time              = expiry_time;
+    m_messages[idx].expiry_mono_timestamp_us = expiry_mono_timestamp_us;
+    m_messages[idx].remaining_expiry_seconds = remaining_expiry_seconds;
+  }
+  void            TestForceSaveFailureOnce() { m_test_force_save_failure_once = true; }
   void            TestForceFinalizeOfflineQueuedFallbackOnce() { m_test_force_finalize_offline_fallback_once = true; }
 
   //--- Persisted circuit-breaker state
@@ -327,6 +345,7 @@ CSessionDatabase::CSessionDatabase()
     , m_last_flush_time(0)
     , m_reconnect_failure_count(0)
     , m_incoming_storage_error_count(0)
+    , m_test_force_save_failure_once(false)
     , m_test_force_finalize_offline_fallback_once(false) {
   ArrayResize(m_messages, 0);
   ArrayResize(m_id_bitfield, 2048);
@@ -543,6 +562,65 @@ bool CSessionDatabase::_ReadFileBuffer(int handle, uint bytes_to_read, uchar& de
   return (uint)FileReadArray(handle, dest, 0, bytes_i) == bytes_to_read;
 }
 
+uint CSessionDatabase::_GetMessageRemainingExpirySeconds(const SessionMessage& msg, datetime now_time,
+                                                         ulong now_us) const {
+  if (msg.remaining_expiry_seconds > 0 && msg.expiry_mono_timestamp_us > 0) {
+    if (now_us == 0) {
+      now_us = GetMicrosecondCount();
+    }
+
+    if (now_us <= msg.expiry_mono_timestamp_us) {
+      return msg.remaining_expiry_seconds;
+    }
+
+    ulong elapsed_us  = now_us - msg.expiry_mono_timestamp_us;
+    ulong lifetime_us = (ulong)msg.remaining_expiry_seconds * 1000000ULL;
+    if (elapsed_us >= lifetime_us) {
+      return 0;
+    }
+
+    return (uint)((lifetime_us - elapsed_us + 999999ULL) / 1000000ULL);
+  }
+
+  if (msg.expiry_time <= 0) {
+    return 0;
+  }
+
+  if (now_time == 0) {
+    now_time = TimeLocal();
+  }
+  if (now_time >= msg.expiry_time) {
+    return 0;
+  }
+
+  return (uint)(msg.expiry_time - now_time);
+}
+
+bool CSessionDatabase::_IsMessageExpired(const SessionMessage& msg, datetime now_time, ulong now_us) const {
+  if (msg.remaining_expiry_seconds > 0 && msg.expiry_mono_timestamp_us > 0) {
+    if (now_us == 0) {
+      now_us = GetMicrosecondCount();
+    }
+
+    if (now_us <= msg.expiry_mono_timestamp_us) {
+      return false;
+    }
+
+    ulong elapsed_us  = now_us - msg.expiry_mono_timestamp_us;
+    ulong lifetime_us = (ulong)msg.remaining_expiry_seconds * 1000000ULL;
+    return elapsed_us >= lifetime_us;
+  }
+
+  if (msg.expiry_time <= 0) {
+    return false;
+  }
+
+  if (now_time == 0) {
+    now_time = TimeLocal();
+  }
+  return now_time >= msg.expiry_time;
+}
+
 uint CSessionDatabase::_GetOfflineRemainingExpirySeconds(const OfflineQueuedMessage& msg, datetime now_time,
                                                          ulong now_us) const {
   if (msg.remaining_expiry_seconds > 0 && msg.mono_timestamp_us > 0) {
@@ -626,12 +704,17 @@ bool CSessionDatabase::_SerializeStateV7(uchar& body[]) const {
     }
   }
 
+  datetime now_time = TimeLocal();
+  ulong    now_us   = GetMicrosecondCount();
+
   if (!_AppendBufferUInt32(body, m_message_count)) {
     return false;
   }
 
   for (uint i = 0; i < m_message_count; i++) {
-    uint prop_len = (uint)ArraySize(m_messages[i].publish_properties);
+    uint     prop_len              = (uint)ArraySize(m_messages[i].publish_properties);
+    uint     remaining_expiry      = _GetMessageRemainingExpirySeconds(m_messages[i], now_time, now_us);
+    datetime persisted_expiry_time = (remaining_expiry > 0) ? (now_time + (datetime)remaining_expiry) : 0;
     if (!_AppendBufferUInt16(body, m_messages[i].packet_id) || !_AppendBufferByte(body, m_messages[i].qos_level)
         || !_AppendBufferUInt32(body, (uint)m_messages[i].qos2_state)
         || !_AppendBufferUtf8String(body, m_messages[i].topic)
@@ -639,11 +722,12 @@ bool CSessionDatabase::_SerializeStateV7(uchar& body[]) const {
         || !_AppendBufferUInt32(body, m_messages[i].payload_size)
         || !_AppendBufferByte(body, (uchar)(m_messages[i].is_outgoing ? 1 : 0))
         || !_AppendBufferUInt32(body, m_messages[i].retransmit_count)
-        || !_AppendBufferUInt64(body, (ulong)m_messages[i].expiry_time)
+        || !_AppendBufferUInt64(body, (ulong)persisted_expiry_time)
         || !_AppendBufferByte(body, m_messages[i].priority)
         || !_AppendBufferByte(body, (uchar)(m_messages[i].retain ? 1 : 0))
         || !_AppendBufferByte(body, (uchar)(m_messages[i].allow_outgoing_subscription_identifier ? 1 : 0))
         || !_AppendBufferUInt64(body, m_messages[i].mono_timestamp_us)
+        || !_AppendBufferUInt32(body, remaining_expiry)
         || !_AppendBufferBytes(body, m_messages[i].payload, m_messages[i].payload_size)
         || !_AppendBufferUInt32(body, prop_len)
         || !_AppendBufferBytes(body, m_messages[i].publish_properties, prop_len)) {
@@ -652,8 +736,6 @@ bool CSessionDatabase::_SerializeStateV7(uchar& body[]) const {
   }
 
   uint     serializable_offline_count = 0;
-  datetime now_time                   = TimeLocal();
-  ulong    now_us                     = GetMicrosecondCount();
   for (uint i = 0; i < m_offline_message_count; i++) {
     if (!_IsOfflineQueuedMessageExpired(m_offline_messages[i], now_time, now_us)) {
       serializable_offline_count++;
@@ -751,6 +833,7 @@ bool CSessionDatabase::_DeserializeStateV7(const uchar& body[], int file_version
     uint  qos2_state                  = 0;
     ulong timestamp                   = 0;
     ulong expiry_time                 = 0;
+    uint  remaining_expiry_seconds    = 0;
     uchar is_outgoing                 = 0;
     uchar retain                      = 0;
     uchar allow_outgoing_sub_id       = 0;
@@ -767,6 +850,7 @@ bool CSessionDatabase::_DeserializeStateV7(const uchar& body[], int file_version
         || !_ReadBufferUInt64(body, offset, expiry_time) || !_ReadBufferByte(body, offset, m_messages[i].priority)
         || !_ReadBufferByte(body, offset, retain) || !_ReadBufferByte(body, offset, allow_outgoing_sub_id)
         || !_ReadBufferUInt64(body, offset, persisted_mono_timestamp_us)
+        || (file_version >= 8 && !_ReadBufferUInt32(body, offset, remaining_expiry_seconds))
         || !_ReadBufferBytes(body, offset, payload_size, m_messages[i].payload)
         || !_ReadBufferUInt32(body, offset, prop_len) || prop_len > 65535
         || !_ReadBufferBytes(body, offset, prop_len, m_messages[i].publish_properties)) {
@@ -779,6 +863,13 @@ bool CSessionDatabase::_DeserializeStateV7(const uchar& body[], int file_version
     m_messages[i].payload_size                           = payload_size;
     m_messages[i].is_outgoing                            = (is_outgoing != 0);
     m_messages[i].expiry_time                            = (datetime)expiry_time;
+    if (file_version < 8 && m_messages[i].expiry_time > 0 && load_now < m_messages[i].expiry_time) {
+      remaining_expiry_seconds = (uint)(m_messages[i].expiry_time - load_now);
+    }
+    m_messages[i].remaining_expiry_seconds               = remaining_expiry_seconds;
+    m_messages[i].expiry_mono_timestamp_us               = (remaining_expiry_seconds > 0)
+                                                              ? (base_mono + (ulong)i * 100000ULL)
+                                                              : 0;
     m_messages[i].retain                                 = (retain != 0);
     m_messages[i].allow_outgoing_subscription_identifier = (allow_outgoing_sub_id != 0);
     m_messages[i].mono_timestamp_us                      = base_mono + (ulong)i * 100000;
@@ -1001,6 +1092,12 @@ bool CSessionDatabase::SaveToFile() {
     return false;
   }
 
+  if (m_test_force_save_failure_once) {
+    m_test_force_save_failure_once = false;
+    MQTT_LOG_WARN("Forcing SaveToFile failure once for test hook.");
+    return false;
+  }
+
   //--- Store in terminal-local MQL5/Files/
   string db_dir = "MQTT_Sessions";
   if (!FolderCreate(db_dir)) {
@@ -1206,6 +1303,7 @@ bool CSessionDatabase::LoadFromFile() {
     case 5:
     case 6:
     case 7:
+    case 8:
       break;
     default:
       MQTT_LOG_ERROR("Session file version " + (string)file_version + " is unknown (expected "
@@ -1397,6 +1495,13 @@ bool CSessionDatabase::LoadFromFile() {
     m_messages[i].is_outgoing      = (bool)FileReadInteger(handle, CHAR_VALUE);
     m_messages[i].retransmit_count = (uint)FileReadInteger(handle, INT_VALUE);
     m_messages[i].expiry_time      = (datetime)FileReadLong(handle);
+    if (m_messages[i].expiry_time > 0 && load_now < m_messages[i].expiry_time) {
+      m_messages[i].remaining_expiry_seconds = (uint)(m_messages[i].expiry_time - load_now);
+      m_messages[i].expiry_mono_timestamp_us = base_mono + (ulong)i * 100000ULL;
+    } else {
+      m_messages[i].remaining_expiry_seconds = 0;
+      m_messages[i].expiry_mono_timestamp_us = 0;
+    }
     m_messages[i].priority         = (uchar)FileReadInteger(handle, CHAR_VALUE);
     if (file_version >= 2) {
       m_messages[i].retain                                 = (bool)FileReadInteger(handle, CHAR_VALUE);
@@ -1656,11 +1761,12 @@ bool   CSessionDatabase::IsValidPacketId(const ushort packet_id) const { return 
 //|          iteration since RemoveMessage modifies m_messages[]).   |
 //+------------------------------------------------------------------+
 void   CSessionDatabase::_PurgeExpiredMessages() {
-  const datetime now = TimeLocal();
+  const datetime now_time = TimeLocal();
+  const ulong    now_us   = GetMicrosecondCount();
   ushort         expired_ids[];
   uint           expired_count = 0;
   for (uint i = 0; i < m_message_count; i++) {
-    if (m_messages[i].expiry_time > 0 && now >= m_messages[i].expiry_time) {
+    if (_IsMessageExpired(m_messages[i], now_time, now_us)) {
       ArrayResize(expired_ids, (int)(expired_count + 1), 16);
       expired_ids[expired_count++] = m_messages[i].packet_id;
     }
@@ -1900,6 +2006,19 @@ bool CSessionDatabase::StoreOutgoingMessageRange(const ushort packet_id, const u
     return false;
   }
 
+  bool           was_dirty                    = m_dirty;
+  uint           backup_message_count         = m_message_count;
+  uint           backup_qos1_count            = m_qos1_count;
+  uint           backup_qos2_count            = m_qos2_count;
+  uint           backup_total_messages_stored = m_total_messages_stored;
+  SessionMessage backup_messages[];
+  if (m_is_persistent) {
+    ArrayResize(backup_messages, (int)m_message_count);
+    for (uint i = 0; i < m_message_count; i++) {
+      backup_messages[i] = m_messages[i];
+    }
+  }
+
   //--- Check if message already exists
   const int existing_idx = FindMessageByPacketId(packet_id, true);
   if (existing_idx >= 0) {
@@ -1920,17 +2039,20 @@ bool CSessionDatabase::StoreOutgoingMessageRange(const ushort packet_id, const u
     //--- Update existing message
     //--- Use TimeLocal() for timestamps - it updates during Sleep() unlike TimeCurrent()
     datetime now                               = TimeLocal();
+    ulong    now_us                            = GetMicrosecondCount();
     m_messages[existing_idx].qos_level         = qos_level;
     //--- Reset QoS 2 state to initial state on update to prevent stale
     //--- state from a prior handshake corrupting the new message flow
     m_messages[existing_idx].qos2_state        = QOS2_STATE_PUBLISH_SENT;
     m_messages[existing_idx].topic             = topic;
     m_messages[existing_idx].timestamp         = now;
-    m_messages[existing_idx].mono_timestamp_us = GetMicrosecondCount();  // Monotonic timestamp for retransmission
+    m_messages[existing_idx].mono_timestamp_us = now_us;  // Monotonic timestamp for retransmission
     m_messages[existing_idx].payload_size      = payload_size;
     m_messages[existing_idx].is_outgoing       = true;
     m_messages[existing_idx].priority          = priority;
     m_messages[existing_idx].expiry_time       = (expiry_interval > 0) ? now + expiry_interval : 0;
+    m_messages[existing_idx].expiry_mono_timestamp_us = (expiry_interval > 0) ? now_us : 0;
+    m_messages[existing_idx].remaining_expiry_seconds = expiry_interval;
     m_messages[existing_idx].retain            = retain;
     m_messages[existing_idx].allow_outgoing_subscription_identifier = allow_outgoing_subscription_identifier;
 
@@ -1942,7 +2064,23 @@ bool CSessionDatabase::StoreOutgoingMessageRange(const ushort packet_id, const u
     if (ArraySize(publish_properties) > 0) {
       ArrayCopy(m_messages[existing_idx].publish_properties, publish_properties);
     }
-    return _WriteThroughMutation();
+    if (_WriteThroughMutation()) {
+      return true;
+    }
+
+    if (m_is_persistent) {
+      ArrayResize(m_messages, (int)backup_message_count);
+      for (uint i = 0; i < backup_message_count; i++) {
+        m_messages[i] = backup_messages[i];
+      }
+      m_message_count         = backup_message_count;
+      m_qos1_count            = backup_qos1_count;
+      m_qos2_count            = backup_qos2_count;
+      m_total_messages_stored = backup_total_messages_stored;
+      m_dirty                 = was_dirty;
+      RebuildMessageIndex();
+    }
+    return false;
   }
 
   //--- Add new message
@@ -1952,17 +2090,20 @@ bool CSessionDatabase::StoreOutgoingMessageRange(const ushort packet_id, const u
 
   //--- Use TimeLocal() for timestamps - it updates during Sleep() unlike TimeCurrent()
   datetime now                          = TimeLocal();
+  ulong    now_us                       = GetMicrosecondCount();
   m_messages[new_idx].packet_id         = packet_id;
   m_messages[new_idx].qos_level         = qos_level;
   m_messages[new_idx].qos2_state        = QOS2_STATE_PUBLISH_SENT;
   m_messages[new_idx].topic             = topic;
   m_messages[new_idx].timestamp         = now;
-  m_messages[new_idx].mono_timestamp_us = GetMicrosecondCount();  // Monotonic timestamp for retransmission
+  m_messages[new_idx].mono_timestamp_us = now_us;  // Monotonic timestamp for retransmission
   m_messages[new_idx].payload_size      = payload_size;
   m_messages[new_idx].is_outgoing       = true;
   m_messages[new_idx].retransmit_count  = 0;
   m_messages[new_idx].priority          = priority;
   m_messages[new_idx].expiry_time       = (expiry_interval > 0) ? now + expiry_interval : 0;
+  m_messages[new_idx].expiry_mono_timestamp_us = (expiry_interval > 0) ? now_us : 0;
+  m_messages[new_idx].remaining_expiry_seconds = expiry_interval;
   m_messages[new_idx].retain            = retain;
   m_messages[new_idx].allow_outgoing_subscription_identifier = allow_outgoing_subscription_identifier;
 
@@ -1991,7 +2132,24 @@ bool CSessionDatabase::StoreOutgoingMessageRange(const ushort packet_id, const u
   }
 
   m_total_messages_stored++;
-  return _WriteThroughMutation();
+  if (_WriteThroughMutation()) {
+    return true;
+  }
+
+  if (m_is_persistent) {
+    ArrayResize(m_messages, (int)backup_message_count);
+    for (uint i = 0; i < backup_message_count; i++) {
+      m_messages[i] = backup_messages[i];
+    }
+    m_message_count         = backup_message_count;
+    m_qos1_count            = backup_qos1_count;
+    m_qos2_count            = backup_qos2_count;
+    m_total_messages_stored = backup_total_messages_stored;
+    m_dirty                 = was_dirty;
+    RebuildMessageIndex();
+  }
+
+  return false;
 }
 
 //+------------------------------------------------------------------+
@@ -2027,17 +2185,49 @@ bool CSessionDatabase::StoreIncomingMessage(const ushort packet_id, const uchar 
     return false;
   }
 
+  bool           was_dirty                    = m_dirty;
+  uint           backup_message_count         = m_message_count;
+  uint           backup_qos1_count            = m_qos1_count;
+  uint           backup_qos2_count            = m_qos2_count;
+  uint           backup_total_messages_stored = m_total_messages_stored;
+  SessionMessage backup_messages[];
+  if (m_is_persistent) {
+    ArrayResize(backup_messages, (int)m_message_count);
+    for (uint i = 0; i < m_message_count; i++) {
+      backup_messages[i] = m_messages[i];
+    }
+  }
+
   //--- Check if message already exists
   const int existing_idx = FindMessageByPacketId(packet_id, false);
   if (existing_idx >= 0) {
     m_messages[existing_idx].timestamp         = TimeLocal();
     m_messages[existing_idx].mono_timestamp_us = GetMicrosecondCount();  // Monotonic timestamp for retransmission
+    m_messages[existing_idx].expiry_time       = 0;
+    m_messages[existing_idx].expiry_mono_timestamp_us = 0;
+    m_messages[existing_idx].remaining_expiry_seconds = 0;
     m_messages[existing_idx].retain            = retain;
     ArrayResize(m_messages[existing_idx].publish_properties, ArraySize(publish_properties));
     if (ArraySize(publish_properties) > 0) {
       ArrayCopy(m_messages[existing_idx].publish_properties, publish_properties);
     }
-    return _WriteThroughMutation();
+    if (_WriteThroughMutation()) {
+      return true;
+    }
+
+    if (m_is_persistent) {
+      ArrayResize(m_messages, (int)backup_message_count);
+      for (uint i = 0; i < backup_message_count; i++) {
+        m_messages[i] = backup_messages[i];
+      }
+      m_message_count         = backup_message_count;
+      m_qos1_count            = backup_qos1_count;
+      m_qos2_count            = backup_qos2_count;
+      m_total_messages_stored = backup_total_messages_stored;
+      m_dirty                 = was_dirty;
+      RebuildMessageIndex();
+    }
+    return false;
   }
 
   //--- Add new message
@@ -2055,6 +2245,8 @@ bool CSessionDatabase::StoreIncomingMessage(const ushort packet_id, const uchar 
   m_messages[new_idx].is_outgoing       = false;
   m_messages[new_idx].retransmit_count  = 0;
   m_messages[new_idx].expiry_time       = 0;
+  m_messages[new_idx].expiry_mono_timestamp_us = 0;
+  m_messages[new_idx].remaining_expiry_seconds = 0;
   m_messages[new_idx].priority          = 0;
   m_messages[new_idx].retain            = retain;
   m_messages[new_idx].allow_outgoing_subscription_identifier = false;
@@ -2076,7 +2268,25 @@ bool CSessionDatabase::StoreIncomingMessage(const ushort packet_id, const uchar 
     m_qos2_count++;
   }
 
-  return _WriteThroughMutation();
+  m_total_messages_stored++;
+  if (_WriteThroughMutation()) {
+    return true;
+  }
+
+  if (m_is_persistent) {
+    ArrayResize(m_messages, (int)backup_message_count);
+    for (uint i = 0; i < backup_message_count; i++) {
+      m_messages[i] = backup_messages[i];
+    }
+    m_message_count         = backup_message_count;
+    m_qos1_count            = backup_qos1_count;
+    m_qos2_count            = backup_qos2_count;
+    m_total_messages_stored = backup_total_messages_stored;
+    m_dirty                 = was_dirty;
+    RebuildMessageIndex();
+  }
+
+  return false;
 }
 
 //+------------------------------------------------------------------+
@@ -2101,6 +2311,17 @@ ulong CSessionDatabase::StoreOfflineQueuedMessage(const uchar qos_level, const s
                                                   const bool allow_outgoing_subscription_identifier) {
   if (qos_level < 1 || qos_level > 2) {
     return 0;
+  }
+
+  bool                 was_dirty              = m_dirty;
+  uint                 backup_offline_count   = m_offline_message_count;
+  ulong                backup_next_offline_id = m_next_offline_message_id;
+  OfflineQueuedMessage backup_offline[];
+  if (m_is_persistent) {
+    ArrayResize(backup_offline, (int)m_offline_message_count);
+    for (uint i = 0; i < m_offline_message_count; i++) {
+      backup_offline[i] = m_offline_messages[i];
+    }
   }
 
   const uint new_idx = m_offline_message_count;
@@ -2138,7 +2359,16 @@ ulong CSessionDatabase::StoreOfflineQueuedMessage(const uchar qos_level, const s
   }
 
   if (m_is_persistent) {
-    m_dirty = true;
+    if (!_WriteThroughMutation()) {
+      ArrayResize(m_offline_messages, (int)backup_offline_count);
+      for (uint i = 0; i < backup_offline_count; i++) {
+        m_offline_messages[i] = backup_offline[i];
+      }
+      m_offline_message_count   = backup_offline_count;
+      m_next_offline_message_id = backup_next_offline_id;
+      m_dirty                   = was_dirty;
+      return 0;
+    }
   }
   return queued_id;
 }
@@ -2430,6 +2660,10 @@ bool CSessionDatabase::GetMessage(const ushort packet_id, SessionMessage& out_ms
   }
 
   out_msg = m_messages[idx];
+  uint remaining_expiry = _GetMessageRemainingExpirySeconds(m_messages[idx]);
+  out_msg.remaining_expiry_seconds = remaining_expiry;
+  out_msg.expiry_mono_timestamp_us = (remaining_expiry > 0) ? GetMicrosecondCount() : 0;
+  out_msg.expiry_time              = (remaining_expiry > 0) ? (TimeLocal() + (datetime)remaining_expiry) : 0;
   return true;
 }
 
@@ -2617,7 +2851,10 @@ uint CSessionDatabase::GetStalledMessages(SessionMessage& dest[], const uint tim
   uint        count       = 0;
   //--- Use monotonic GetMicrosecondCount() for retransmission timeout
   //--- to avoid clock-skew issues (NTP sync, DST transitions, VM drift).
-  const ulong mono_now_us = GetMicrosecondCount();
+  const ulong    mono_now_us = GetMicrosecondCount();
+  const datetime now_time    = TimeLocal();
+
+  _PurgeExpiredMessages();
 
   //--- Scan the now-clean collection for stalled messages
   for (uint i = 0; i < m_message_count; i++) {
@@ -2637,6 +2874,11 @@ uint CSessionDatabase::GetStalledMessages(SessionMessage& dest[], const uint tim
 
       ArrayResize(dest, count + 1, 16);
       dest[count] = m_messages[i];
+      dest[count].remaining_expiry_seconds = _GetMessageRemainingExpirySeconds(m_messages[i], now_time, mono_now_us);
+      dest[count].expiry_mono_timestamp_us = (dest[count].remaining_expiry_seconds > 0) ? mono_now_us : 0;
+      dest[count].expiry_time              = (dest[count].remaining_expiry_seconds > 0)
+                                                ? (now_time + (datetime)dest[count].remaining_expiry_seconds)
+                                                : 0;
       count++;
     }
   }
@@ -2779,6 +3021,7 @@ void CSessionDatabase::Clear() {
   m_incoming_storage_error_count              = 0;
   m_session_id                                = "";
   m_is_persistent                             = false;
+  m_test_force_save_failure_once              = false;
   m_test_force_finalize_offline_fallback_once = false;
 }
 
