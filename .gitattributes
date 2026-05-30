@@ -1,5 +1,24 @@
 # Keep archive exports aligned with the curated public release surface.
 
+# Normalize text files in the repository.
+* text=auto
+
+# Keep Windows-native line endings for MetaTrader source and Windows tooling.
+*.mq5 text eol=crlf
+*.mqh text eol=crlf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Keep cross-platform configs and docs in LF.
+.clang-format text eol=lf
+.clangd text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+
 # Generated outputs and disposable artifacts never belong in release archives.
 *.ex4 export-ignore
 *.ex5 export-ignore
