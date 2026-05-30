@@ -11,6 +11,7 @@
 *.cmd text eol=crlf
 
 # Keep cross-platform configs and docs in LF.
+.gitattributes text eol=lf
 .clang-format text eol=lf
 .clangd text eol=lf
 *.md text eol=lf
